@@ -1,5 +1,10 @@
 # hebbrix-mcp
 
+[![PyPI](https://img.shields.io/pypi/v/hebbrix-mcp)](https://pypi.org/project/hebbrix-mcp/)
+[![CI](https://github.com/Hebbrix/hebbrix-mcp/actions/workflows/ci.yml/badge.svg)](https://github.com/Hebbrix/hebbrix-mcp/actions/workflows/ci.yml)
+[![Python](https://img.shields.io/pypi/pyversions/hebbrix-mcp)](https://pypi.org/project/hebbrix-mcp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+
 **Long-term memory and a knowledge graph for any MCP-compatible agent.**
 
 Your agent forgets everything when the session ends. This server fixes that — and goes further than a plain memory store:
