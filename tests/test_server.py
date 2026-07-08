@@ -238,3 +238,12 @@ def test_env_api_base_wins_over_saved(monkeypatch, tmp_path):
     monkeypatch.setattr(S, "_API_BASE_FROM_ENV", True)  # user DID set env
     S._load_saved_credentials()
     assert S.BASE == "https://api.hebbrix.com/v1"  # env wins, saved ignored
+
+
+def test_pow_solver_produces_valid_nonce():
+    import hashlib
+    bits = 12  # low so the test is instant
+    nonce = S._solve_pow("chal-xyz", bits, max_seconds=10)
+    assert nonce is not None
+    digest = hashlib.sha256(f"chal-xyz:{nonce}".encode()).digest()
+    assert int.from_bytes(digest, "big") < (1 << (256 - bits))

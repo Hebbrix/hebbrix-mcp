@@ -119,19 +119,51 @@ def _save_credentials(data: dict[str, Any]) -> None:
         pass
 
 
+def _solve_pow(challenge: str, bits: int, max_seconds: float = 15.0) -> Optional[str]:
+    """Find a nonce so sha256(f'{challenge}:{nonce}') has >= `bits` leading zero
+    bits. ~1-2s at 20 bits. A solved PoW lets the mint skip the per-IP cap, which
+    is what makes signup work behind a shared office / CGNAT IP. Bounded by
+    max_seconds so it never hangs the server start."""
+    import hashlib
+    import time as _time
+
+    target = 1 << (256 - bits)
+    deadline = _time.monotonic() + max_seconds
+    nonce = 0
+    while _time.monotonic() < deadline:
+        for _ in range(20000):  # batch so the clock check doesn't dominate
+            if int.from_bytes(hashlib.sha256(f"{challenge}:{nonce}".encode()).digest(), "big") < target:
+                return str(nonce)
+            nonce += 1
+    return None
+
+
 def _auto_provision() -> bool:
     """Accountless start: mint a shadow identity via POST /agent-signup.
 
     Gives any agent a working Hebbrix account in one call — no email, no
-    dashboard. The account has lifetime caps and expires if unclaimed; every
-    tool response carries a `hebbrix_usage` block telling the agent when and
-    how to suggest claiming.
+    dashboard. Solves a small proof-of-work first so signup works even behind a
+    shared office / CGNAT IP (a valid PoW skips the per-IP cap). Falls back to a
+    plain mint if the challenge endpoint is unavailable. Every tool response then
+    carries a `hebbrix_usage` block telling the agent when/how to suggest claiming.
     """
     global KEY, DEFAULT_COLLECTION
     caller = "claude-code" if os.environ.get("CLAUDECODE") else (
         "cursor" if os.environ.get("CURSOR_TRACE_ID") else "unknown")
+    body: dict[str, Any] = {"agent_caller": caller}
+    # Proof-of-work (best effort): get a challenge, solve it, attach the nonce.
     try:
-        r = httpx.post(f"{BASE}/agent-signup", json={"agent_caller": caller}, timeout=20.0)
+        ch = httpx.post(f"{BASE}/agent-signup/challenge", timeout=15.0)
+        if ch.status_code == 200:
+            cj = ch.json()
+            nonce = _solve_pow(cj["challenge"], int(cj["difficulty_bits"]))
+            if nonce is not None:
+                body["challenge"] = cj["challenge"]
+                body["nonce"] = nonce
+    except Exception:
+        pass  # old backend / no challenge endpoint -> plain mint under IP caps
+    try:
+        r = httpx.post(f"{BASE}/agent-signup", json=body, timeout=20.0)
     except Exception as e:
         print(f"hebbrix-mcp: auto-signup failed ({e}). Set HEBBRIX_API_KEY instead.",
               file=sys.stderr)

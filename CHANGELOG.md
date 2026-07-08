@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.4 — 2026-07-08
+
+- **Proof-of-work signup for shared-IP / CGNAT.** On the accountless path the
+  client now solves a small (~1-2s) proof-of-work before minting; a PoW-verified
+  signup skips the per-IP cap server-side, so users behind a shared office or
+  carrier-grade NAT IP can each still get a free agent account. Falls back to a
+  plain mint automatically if the server doesn't offer a challenge. No user-
+  visible change — it stays fully automatic (no CAPTCHA).
+
+
 ## 0.3.3 — 2026-07-08
 
 Fixes from external integrator feedback.
