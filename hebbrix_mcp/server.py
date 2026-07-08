@@ -461,7 +461,7 @@ async def hebbrix_account_status() -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
-# Resource + prompt (Supermemory pattern: inject a compiled profile)           #
+# Resource + prompt: inject the user's compiled profile into the conversation  #
 # --------------------------------------------------------------------------- #
 @mcp.resource("hebbrix://profile")
 async def profile_resource() -> str:
