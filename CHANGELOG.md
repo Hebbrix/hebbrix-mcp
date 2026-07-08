@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.2 — 2026-07-08
+
+- Fix: the per-response usage snapshot is now request-scoped (ContextVar), so
+  concurrent requests in multi-tenant hosted mode never cross-contaminate each
+  other's `hebbrix_usage` block.
+- Docs: README restructured to the MCP-ecosystem idiom (mcp-name registry
+  marker, `uvx` as the recommended runner, canonical tool list, Debugging
+  section via MCP Inspector).
+
 ## 0.3.1 — 2026-07-07
 
 - `hebbrix-mcp claim --email <you>` is now the full interactive flow: requests

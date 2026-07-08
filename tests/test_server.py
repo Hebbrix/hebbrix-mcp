@@ -57,9 +57,9 @@ class FakeClient:
 
 @pytest.fixture(autouse=True)
 def reset_usage():
-    S._LAST_USAGE.clear()
+    S._LAST_USAGE.set(None)  # per-request ContextVar, cleared between tests
     yield
-    S._LAST_USAGE.clear()
+    S._LAST_USAGE.set(None)
 
 
 def _fake(monkeypatch, response: FakeResponse) -> FakeClient:

@@ -10,12 +10,13 @@ Transports (choose at launch, see run()):
   - stdio            local: Claude Desktop, Cline, Cursor, Continue
   - streamable-http  remote/self-hosted: point clients at the URL
 
-Configured via env vars:
-  HEBBRIX_API_KEY        required, Bearer token (get one at hebbrix.com)
-  HEBBRIX_API_BASE       optional, default https://api.hebbrix.com/v1
-  HEBBRIX_COLLECTION_ID  optional, default collection for writes/reads
-  HEBBRIX_MCP_HOST       optional, default 127.0.0.1 (streamable-http only)
-  HEBBRIX_MCP_PORT       optional, default 8080     (streamable-http only)
+Configured via env vars (all optional — with none set, the server starts in
+agent mode and mints a free account automatically):
+  HEBBRIX_API_KEY        Bearer token (agent mode mints one if unset)
+  HEBBRIX_API_BASE       default https://api.hebbrix.com/v1
+  HEBBRIX_COLLECTION_ID  default collection for writes/reads
+  HEBBRIX_CONFIG         where agent-mode credentials are saved
+  HEBBRIX_MCP_HOST/PORT  bind address (streamable-http only)
 """
 from __future__ import annotations
 
@@ -43,10 +44,12 @@ PORT = int(os.environ.get("HEBBRIX_MCP_PORT", "8080"))
 # Saved credentials from a previous auto-provision (agent mode). Env vars win.
 CONFIG_PATH = Path(os.environ.get("HEBBRIX_CONFIG", "~/.hebbrix/config.json")).expanduser()
 
-# Usage snapshot from the most recent API response's X-Hebbrix-* headers.
-# Attached to every tool result so the AGENT sees tier/limits/expiry and can
-# relay the claim command to its human at the right moment.
-_LAST_USAGE: dict[str, Any] = {}
+# Usage snapshot from the most recent API response's X-Hebbrix-* headers,
+# attached to every tool result so the AGENT sees tier/limits/expiry and can
+# relay the claim command to its human at the right moment. Held in a ContextVar
+# (not a module global) so concurrent requests in multi-tenant hosted mode never
+# cross-contaminate each other's usage block.
+_LAST_USAGE: ContextVar[Optional[dict]] = ContextVar("hebbrix_last_usage", default=None)
 
 # A server-level instructions block teaches the model the data model and when to
 # reach for each tool. This is the single cheapest lever on agent behavior.
@@ -174,8 +177,7 @@ def _capture_usage(r: httpx.Response) -> None:
     h = r.headers
     if "x-hebbrix-tier" not in h:
         return
-    _LAST_USAGE.clear()
-    _LAST_USAGE.update({
+    usage: dict[str, Any] = {
         "tier": h.get("x-hebbrix-tier"),
         "status": h.get("x-hebbrix-status"),
         "writes": {"used": int(h.get("x-hebbrix-writes-used", 0)),
@@ -184,22 +186,23 @@ def _capture_usage(r: httpx.Response) -> None:
                        "limit": int(h.get("x-hebbrix-retrievals-limit", 0))},
         "expires_at": h.get("x-hebbrix-expires-at"),
         "claim_command": h.get("x-hebbrix-claim"),
-    })
-    status_ = _LAST_USAGE.get("status")
-    if status_ in ("warning", "limited", "read_only"):
-        w = _LAST_USAGE["writes"]
-        _LAST_USAGE["action_for_human"] = (
+    }
+    if usage["status"] in ("warning", "limited", "read_only"):
+        w = usage["writes"]
+        usage["action_for_human"] = (
             f"Hebbrix agent allowance at {w['used']}/{w['limit']} writes "
-            f"(status: {status_}). Run `{_LAST_USAGE.get('claim_command')}` to claim "
+            f"(status: {usage['status']}). Run `{usage.get('claim_command')}` to claim "
             "this account and unlock the free monthly tier — the key and all "
             "memories carry over."
         )
+    _LAST_USAGE.set(usage)
 
 
 def _u(out: dict[str, Any]) -> dict[str, Any]:
     """Attach the usage block to a tool result (agents relay it to humans)."""
-    if _LAST_USAGE and isinstance(out, dict):
-        out.setdefault("hebbrix_usage", dict(_LAST_USAGE))
+    usage = _LAST_USAGE.get()
+    if usage and isinstance(out, dict):
+        out.setdefault("hebbrix_usage", dict(usage))
     return out
 
 
