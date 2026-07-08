@@ -26,6 +26,7 @@ import sys
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -40,6 +41,11 @@ KEY = os.environ.get("HEBBRIX_API_KEY", "")
 DEFAULT_COLLECTION = os.environ.get("HEBBRIX_COLLECTION_ID", "")
 HOST = os.environ.get("HEBBRIX_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HEBBRIX_MCP_PORT", "8080"))
+# Hosted mode: authenticate every request from its own bearer header, never the
+# server's key. `_API_BASE_FROM_ENV` lets a saved api_base be honored on reload
+# while an explicit env var still wins.
+MULTI_TENANT = os.environ.get("HEBBRIX_MCP_MULTI_TENANT", "").lower() in ("1", "true", "yes")
+_API_BASE_FROM_ENV = "HEBBRIX_API_BASE" in os.environ
 
 # Saved credentials from a previous auto-provision (agent mode). Env vars win.
 CONFIG_PATH = Path(os.environ.get("HEBBRIX_CONFIG", "~/.hebbrix/config.json")).expanduser()
@@ -86,8 +92,8 @@ mcp = FastMCP("hebbrix", instructions=INSTRUCTIONS, host=HOST, port=PORT)
 # Credentials: env var > saved config > auto-provision (agent mode)            #
 # --------------------------------------------------------------------------- #
 def _load_saved_credentials() -> bool:
-    """Fill KEY/DEFAULT_COLLECTION from ~/.hebbrix/config.json (env wins)."""
-    global KEY, DEFAULT_COLLECTION
+    """Fill KEY/DEFAULT_COLLECTION/BASE from ~/.hebbrix/config.json (env wins)."""
+    global KEY, DEFAULT_COLLECTION, BASE
     try:
         cfg = json.loads(CONFIG_PATH.read_text())
     except Exception:
@@ -96,6 +102,11 @@ def _load_saved_credentials() -> bool:
         KEY = cfg["api_key"]
     if not DEFAULT_COLLECTION and cfg.get("collection_id"):
         DEFAULT_COLLECTION = cfg["collection_id"]
+    # Honor the api_base the key was minted against, so a custom-base user
+    # doesn't silently revert to the default endpoint on reload. Explicit
+    # HEBBRIX_API_BASE env still wins.
+    if not _API_BASE_FROM_ENV and cfg.get("api_base"):
+        BASE = str(cfg["api_base"]).rstrip("/")
     return bool(KEY)
 
 
@@ -126,8 +137,28 @@ def _auto_provision() -> bool:
               file=sys.stderr)
         return False
     if r.status_code != 201:
-        print(f"hebbrix-mcp: auto-signup unavailable (HTTP {r.status_code}: {r.text[:160]}). "
-              "Set HEBBRIX_API_KEY instead.", file=sys.stderr)
+        code = None
+        try:
+            code = (r.json().get("detail") or {}).get("code")
+        except Exception:
+            pass
+        if code in ("MINT_IP_LIMIT", "MINT_SUBNET_LIMIT", "AGENT_SIGNUP_AT_CAPACITY"):
+            print(
+                "hebbrix-mcp: free no-account signup is rate-limited from your network "
+                "right now (common on shared/office/CGNAT IPs, or after a few trials).\n"
+                "  Fastest fix: get a free API key in ~30s at "
+                "https://www.hebbrix.com/dashboard/api-keys and set HEBBRIX_API_KEY.\n"
+                "  Already provisioned once here? An existing ~/.hebbrix/config.json is "
+                "reused automatically.",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"hebbrix-mcp: auto-signup unavailable (HTTP {r.status_code}). "
+                "Get a free key at https://www.hebbrix.com/dashboard/api-keys and set "
+                "HEBBRIX_API_KEY.",
+                file=sys.stderr,
+            )
         return False
     data = r.json()
     KEY = data["api_key"]
@@ -155,9 +186,13 @@ def _auto_provision() -> bool:
 # HTTP helpers                                                                 #
 # --------------------------------------------------------------------------- #
 def _client() -> httpx.AsyncClient:
-    # Headers built per call — the key may come from a per-request Authorization
-    # header (multi-tenant hosted mode) or be set by auto-provision after import.
-    key = _REQUEST_KEY.get() or KEY
+    # Headers built per call. In multi-tenant mode the key MUST come from the
+    # per-request Authorization header — never the server's global KEY, so a
+    # stray HEBBRIX_API_KEY on a hosted deployment can't leak into an
+    # unauthenticated request. (The middleware already 401s missing bearers;
+    # this is defense in depth.) In single-tenant/stdio mode, fall back to the
+    # global key set from env / saved config / auto-provision.
+    key = _REQUEST_KEY.get() or ("" if MULTI_TENANT else KEY)
     return httpx.AsyncClient(
         timeout=30.0,
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
@@ -375,7 +410,9 @@ async def hebbrix_entity_timeline(entity_name: str, collection_id: Optional[str]
     """Bi-temporal timeline for one entity: what facts were true about it and when.
     Use this for "what changed" / "what was true at time X" questions about a person,
     company, or thing."""
-    return _u(await _get(f"/knowledge-graph/timeline/{entity_name}", {"collection_id": _cid(collection_id)}))
+    # entity_name is free text -> URL-encode so names with / ? # % don't break the path
+    return _u(await _get(f"/knowledge-graph/timeline/{quote(entity_name, safe='')}",
+                         {"collection_id": _cid(collection_id)}))
 
 
 @mcp.tool()
@@ -502,7 +539,21 @@ class _HeaderAuthMiddleware:
             headers = {k.decode().lower(): v.decode()
                        for k, v in (scope.get("headers") or [])}
             auth = headers.get("authorization", "")
-            token = auth[7:] if auth.lower().startswith("bearer ") else ""
+            token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
+            if not token:
+                # Multi-tenant requires a per-request key. Reject here rather
+                # than let the request fall through — never serve it with a
+                # server-side key.
+                body = (b'{"error":{"code":"UNAUTHORIZED","message":"This Hebbrix '
+                        b'MCP endpoint requires an Authorization: Bearer <hebbrix-api-key> '
+                        b'header on every request."}}')
+                await send({"type": "http.response.start", "status": 401, "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                    (b"www-authenticate", b"Bearer"),
+                ]})
+                await send({"type": "http.response.body", "body": body})
+                return
             reset = _REQUEST_KEY.set(token)
             try:
                 await self.app(scope, receive, send)
@@ -592,9 +643,8 @@ def run() -> None:
             transport = sys.argv[i + 1]
 
     # Hosted multi-tenant mode: no server-side key at all — every request must
-    # bring its own Authorization header (or hit /agent-signup itself first).
-    multi_tenant = os.environ.get("HEBBRIX_MCP_MULTI_TENANT", "").lower() in ("1", "true", "yes")
-    if multi_tenant:
+    # bring its own Authorization header (enforced by _HeaderAuthMiddleware).
+    if MULTI_TENANT:
         if transport not in ("streamable-http", "http"):
             raise SystemExit("HEBBRIX_MCP_MULTI_TENANT requires --transport streamable-http")
         import uvicorn

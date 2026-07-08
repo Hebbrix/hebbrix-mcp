@@ -180,3 +180,61 @@ def test_request_key_contextvar_overrides_global(monkeypatch):
         S._REQUEST_KEY.reset(token)
     client = S._client()
     assert client.headers["authorization"] == f"Bearer {S.KEY}"
+
+
+# ------------------------------- customer-reported fixes (v0.3.3) -----------
+def test_multi_tenant_client_never_uses_global_key(monkeypatch):
+    # In multi-tenant mode with a stray global KEY set, a request with no
+    # per-request bearer must NOT borrow the server key.
+    monkeypatch.setattr(S, "MULTI_TENANT", True)
+    monkeypatch.setattr(S, "KEY", "mem_sk_server_should_not_leak")
+    token = S._REQUEST_KEY.set("")  # simulate a request with no bearer
+    try:
+        c = S._client()
+        assert c.headers["authorization"] == "Bearer "  # empty, not the server key
+    finally:
+        S._REQUEST_KEY.reset(token)
+    # single-tenant still falls back to the configured key
+    monkeypatch.setattr(S, "MULTI_TENANT", False)
+    tok = S._REQUEST_KEY.set("")
+    try:
+        assert S._client().headers["authorization"] == "Bearer mem_sk_server_should_not_leak"
+    finally:
+        S._REQUEST_KEY.reset(tok)
+
+
+def test_entity_timeline_url_encodes_name(monkeypatch):
+    captured = {}
+    orig = S._get
+    async def spy(path, params=None):
+        captured["path"] = path
+        return {"ok": True}
+    monkeypatch.setattr(S, "_get", spy)
+    import asyncio
+    asyncio.run(S.hebbrix_entity_timeline("Acme/Corp?x#y", collection_id="c1"))
+    assert "Acme/Corp?x#y" not in captured["path"]
+    assert "Acme%2FCorp%3Fx%23y" in captured["path"]
+
+
+def test_load_saved_credentials_reads_api_base(monkeypatch, tmp_path):
+    import json as _json
+    cfg = tmp_path / "config.json"
+    cfg.write_text(_json.dumps({"api_key": "mem_sk_x", "api_base": "https://staging.hebbrix.com/v2"}))
+    monkeypatch.setattr(S, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(S, "KEY", "")
+    monkeypatch.setattr(S, "BASE", "https://api.hebbrix.com/v1")
+    monkeypatch.setattr(S, "_API_BASE_FROM_ENV", False)  # user did NOT set env
+    S._load_saved_credentials()
+    assert S.BASE == "https://staging.hebbrix.com/v2"
+
+
+def test_env_api_base_wins_over_saved(monkeypatch, tmp_path):
+    import json as _json
+    cfg = tmp_path / "config.json"
+    cfg.write_text(_json.dumps({"api_key": "mem_sk_x", "api_base": "https://staging.hebbrix.com/v2"}))
+    monkeypatch.setattr(S, "CONFIG_PATH", cfg)
+    monkeypatch.setattr(S, "KEY", "")
+    monkeypatch.setattr(S, "BASE", "https://api.hebbrix.com/v1")
+    monkeypatch.setattr(S, "_API_BASE_FROM_ENV", True)  # user DID set env
+    S._load_saved_credentials()
+    assert S.BASE == "https://api.hebbrix.com/v1"  # env wins, saved ignored

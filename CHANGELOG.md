@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.3.3 — 2026-07-08
+
+Fixes from external integrator feedback.
+
+- **Multi-tenant safety**: `_client()` no longer falls back to the server's
+  global key in multi-tenant mode, and `_HeaderAuthMiddleware` now rejects any
+  request without an `Authorization: Bearer` header with 401 — a stray
+  `HEBBRIX_API_KEY` on a hosted deployment can never serve an unauthenticated
+  request.
+- **URL-encode** `entity_name` in `hebbrix_entity_timeline` so names with
+  `/ ? # %` don't break the request path.
+- **Honor saved `api_base`**: `_load_saved_credentials()` now reads `api_base`
+  back from `~/.hebbrix/config.json` (explicit `HEBBRIX_API_BASE` env still
+  wins), so custom-endpoint users don't silently revert to the default.
+- **Actionable rate-limit message**: when the free no-account signup is
+  rate-limited (shared/office/CGNAT IPs), the server now points to the 30-second
+  free-API-key path instead of dumping the raw HTTP error.
+- Docs: `__init__` tool count corrected to 15 (`hebbrix_account_status`).
+
+
 ## 0.3.2 — 2026-07-08
 
 - Fix: the per-response usage snapshot is now request-scoped (ContextVar), so
