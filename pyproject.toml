@@ -1,0 +1,68 @@
+[build-system]
+requires = ["hatchling>=1.18"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hebbrix-mcp"
+version = "0.3.1"
+description = "Hebbrix MCP server — long-term memory and knowledge graph for any MCP-compatible agent (Claude Desktop, Cline, Cursor, etc.)"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Hebbrix", email = "support@hebbrix.com" },
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "memory",
+    "ai-agents",
+    "claude",
+    "cursor",
+    "cline",
+    "hebbrix",
+    "long-term-memory",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp[cli]>=1.0",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+]
+
+[project.urls]
+Homepage = "https://www.hebbrix.com"
+Documentation = "https://www.hebbrix.com/integrations/mcp"
+Repository = "https://github.com/Hebbrix/hebbrix-mcp"
+Issues = "https://github.com/Hebbrix/hebbrix-mcp/issues"
+
+[project.scripts]
+hebbrix-mcp = "hebbrix_mcp.server:run"
+
+[tool.hatch.build.targets.wheel]
+packages = ["hebbrix_mcp"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/hebbrix_mcp",
+    "/README.md",
+    "/LICENSE",
+    "/quick_setup.sh",
+]
