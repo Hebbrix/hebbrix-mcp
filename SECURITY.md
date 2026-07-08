@@ -16,7 +16,7 @@ secrets. The only sensitive material it touches is:
 - your `HEBBRIX_API_KEY` (env var or `~/.hebbrix/config.json`, written `0600`)
 - memory content in transit to `api.hebbrix.com` over HTTPS
 
-Vulnerabilities in the Hebbrix backend/API itself are also welcome at the
+Vulnerabilities in the Hebbrix service or API itself are also welcome at the
 same address.
 
 ## Supported versions

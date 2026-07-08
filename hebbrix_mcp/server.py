@@ -31,7 +31,7 @@ import httpx
 from mcp.server.fastmcp import FastMCP
 
 # Multi-tenant (hosted) mode: each HTTP request's own Authorization header is
-# the key, so ONE deployed instance serves many users (Supermemory/Mem0
+# the key, so ONE deployed instance serves many users (the standard hosted-MCP
 # pattern). Set per-request by _HeaderAuthMiddleware; empty = use global KEY.
 _REQUEST_KEY: ContextVar[str] = ContextVar("hebbrix_request_key", default="")
 
