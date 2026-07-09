@@ -59,10 +59,12 @@ class FakeClient:
 def reset_usage():
     S._LAST_USAGE.set(None)  # per-request ContextVar, cleared between tests
     S._RECENT_WRITES.clear()  # process-global session caches — isolate each test
+    S._RECENT_DELETES.clear()
     S._RECENT_CONFIDENCE.clear()
     yield
     S._LAST_USAGE.set(None)
     S._RECENT_WRITES.clear()
+    S._RECENT_DELETES.clear()
     S._RECENT_CONFIDENCE.clear()
 
 
@@ -343,7 +345,7 @@ def test_graph_query_requires_entity_and_lowercases(monkeypatch):
 def test_get_after_write_served_from_cache_on_remote_miss(monkeypatch):
     # A memory written this session must resolve by id even if the remote
     # read 404s (index not caught up yet).
-    S._remember_write("w1", "the launch is on Friday", "c1")
+    S._cache_put("w1", "the launch is on Friday", "c1")
     _fake(monkeypatch, FakeResponse(404, text="not found"))
     out = asyncio.run(S.hebbrix_get("w1"))
     assert out["id"] == "w1" and out["content"] == "the launch is on Friday"
@@ -357,7 +359,7 @@ def test_get_error_without_cache_still_returns_error(monkeypatch):
 
 
 def test_search_overlays_just_written_memory(monkeypatch):
-    S._remember_write("w1", "the sky is blue today", "c1")
+    S._cache_put("w1", "the sky is blue today", "c1")
     _fake(monkeypatch, FakeResponse(200, {"results": [
         {"memory_id": "remote1", "content": "unrelated", "score": 0.4}]}))
     out = asyncio.run(S.hebbrix_search("sky", collection_id="c1", limit=5))
@@ -368,15 +370,15 @@ def test_search_overlays_just_written_memory(monkeypatch):
 
 
 def test_search_overlay_respects_collection_and_query(monkeypatch):
-    S._remember_write("w1", "cats are great", "OTHER")   # wrong collection
-    S._remember_write("w2", "dogs are loud", "c1")        # right collection, no match
+    S._cache_put("w1", "cats are great", "OTHER")   # wrong collection
+    S._cache_put("w2", "dogs are loud", "c1")        # right collection, no match
     _fake(monkeypatch, FakeResponse(200, {"results": []}))
     out = asyncio.run(S.hebbrix_search("elephant", collection_id="c1"))
     assert out["results"] == []  # neither matches scope+query
 
 
 def test_search_overlay_dedupes_already_returned(monkeypatch):
-    S._remember_write("remote1", "the sky is blue", "c1")
+    S._cache_put("remote1", "the sky is blue", "c1")
     _fake(monkeypatch, FakeResponse(200, {"results": [
         {"memory_id": "remote1", "content": "the sky is blue", "score": 0.9}]}))
     out = asyncio.run(S.hebbrix_search("sky", collection_id="c1"))
@@ -384,7 +386,7 @@ def test_search_overlay_dedupes_already_returned(monkeypatch):
 
 
 def test_list_overlays_just_written(monkeypatch):
-    S._remember_write("w1", "fresh memory", "c1")
+    S._cache_put("w1", "fresh memory", "c1")
     _fake(monkeypatch, FakeResponse(200, {"items": []}))
     out = asyncio.run(S.hebbrix_list(collection_id="c1"))
     assert any(m["id"] == "w1" and m.get("just_written") for m in out["memories"])
@@ -393,7 +395,7 @@ def test_list_overlays_just_written(monkeypatch):
 def test_multi_tenant_disables_local_cache(monkeypatch):
     monkeypatch.setattr(S, "_LOCAL_CACHE", False)
     S._RECENT_WRITES.clear()
-    S._remember_write("w1", "should not cache", "c1")
+    S._cache_put("w1", "should not cache", "c1")
     assert len(S._RECENT_WRITES) == 0
     assert S._cached_write("w1") is None
 
@@ -469,3 +471,153 @@ def test_missing_bearer_still_401():
 def test_valid_bearer_reaches_inner_app():
     sent = _run_mw("POST", "/mcp", headers={"authorization": "Bearer mem_sk_x"})
     assert any(m.get("type") == "INNER_APP_CALLED" for m in sent)
+
+
+# ============================================================================
+# Mutation-consistency regressions (v0.3.10) — the customer report:
+# updates and deletes must not leak stale/deleted content through the cache.
+# ============================================================================
+
+# --- #1 update: search returns corrected content, not stale remote ----------
+def test_update_refreshes_cache_search_returns_corrected(monkeypatch):
+    # hebbrix_update m1 -> Borealis (PATCH response carries collection_id)
+    _fake(monkeypatch, FakeResponse(200, {"id": "m1", "collection_id": "c1"}))
+    up = asyncio.run(S.hebbrix_update("m1", content="the codename is Borealis"))
+    assert up["updated"] is True
+    # remote search still returns the stale Aurora row for the SAME id
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "m1", "content": "the codename is Aurora", "score": 0.9}]}))
+    out = asyncio.run(S.hebbrix_search("codename", collection_id="c1"))
+    row = next(r for r in out["results"] if r["id"] == "m1")
+    assert row["content"] == "the codename is Borealis"   # cached correction wins
+    assert row.get("corrected") is True
+    assert "Aurora" not in row["content"]
+
+
+def test_update_sends_wait_for_index(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"id": "m1"}))
+    asyncio.run(S.hebbrix_update("m1", content="x", wait_for_index=True))
+    assert client.calls[-1][2]["json"]["wait_for_index"] is True
+
+
+# --- #2 update: remote omits the id -> overlay supplies corrected content ----
+def test_update_then_search_overlays_when_remote_omits(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"id": "m1", "collection_id": "c1"}))
+    asyncio.run(S.hebbrix_update("m1", content="borealis is the codename"))
+    _fake(monkeypatch, FakeResponse(200, {"results": []}))  # remote not indexed yet
+    out = asyncio.run(S.hebbrix_search("borealis", collection_id="c1"))
+    m1 = next(r for r in out["results"] if r["id"] == "m1")
+    assert m1["content"] == "borealis is the codename" and m1.get("just_written") is True
+
+
+# --- #3 delete: search omits it -> stays absent (no overlay resurrection) -----
+def test_delete_removes_from_overlay(monkeypatch):
+    S._cache_put("m1", "ephemeral fact", "c1")
+    _fake(monkeypatch, FakeResponse(204))
+    d = asyncio.run(S.hebbrix_forget("m1"))
+    assert d["ok"] is True and S._is_tombstoned("m1")
+    _fake(monkeypatch, FakeResponse(200, {"results": []}))
+    out = asyncio.run(S.hebbrix_search("ephemeral", collection_id="c1"))
+    assert all(r["id"] != "m1" for r in out["results"])
+
+
+# --- #4 delete: stale remote search STILL returns it -> tombstone filters -----
+def test_delete_tombstone_filters_stale_remote_search(monkeypatch):
+    _fake(monkeypatch, FakeResponse(204))
+    asyncio.run(S.hebbrix_forget("m1"))
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "m1", "content": "still here", "score": 0.8}]}))
+    out = asyncio.run(S.hebbrix_search("here", collection_id="c1"))
+    assert out["count"] == 0 and all(r["id"] != "m1" for r in out["results"])
+
+
+# --- #5 delete: remote get 404 must NOT fall back to cached content ----------
+def test_get_after_delete_does_not_resurrect(monkeypatch):
+    S._cache_put("m1", "old cached content", "c1")   # created earlier this session
+    _fake(monkeypatch, FakeResponse(204))
+    asyncio.run(S.hebbrix_forget("m1"))
+    # get on a tombstoned id: structured deleted response, no cache fallback
+    _fake(monkeypatch, FakeResponse(404, text="not found"))
+    out = asyncio.run(S.hebbrix_get("m1"))
+    assert out.get("deleted") is True and "error" in out
+    assert "old cached content" not in str(out)
+
+
+def test_cached_write_never_returns_tombstoned():
+    S._cache_put("m1", "content", "c1")
+    assert S._cached_write("m1") is not None
+    S._cache_delete("m1")
+    assert S._cached_write("m1") is None
+
+
+def test_forget_on_remote_404_also_tombstones(monkeypatch):
+    S._cache_put("m1", "x", "c1")
+    _fake(monkeypatch, FakeResponse(404, text="already gone"))
+    d = asyncio.run(S.hebbrix_forget("m1"))
+    assert d["ok"] is False and S._is_tombstoned("m1")  # idempotent delete
+
+
+def test_forget_on_5xx_does_not_tombstone(monkeypatch):
+    S._cache_put("m1", "x", "c1")
+    _fake(monkeypatch, FakeResponse(503, text="unavailable"))
+    asyncio.run(S.hebbrix_forget("m1"))
+    assert S._is_tombstoned("m1") is False  # transient error must not delete
+
+
+# --- #6 deleted memory absent from list --------------------------------------
+def test_deleted_memory_absent_from_list(monkeypatch):
+    _fake(monkeypatch, FakeResponse(204))
+    asyncio.run(S.hebbrix_forget("m1"))
+    _fake(monkeypatch, FakeResponse(200, {"items": [
+        {"id": "m1", "content": "zombie"}, {"id": "m2", "content": "alive"}]}))
+    out = asyncio.run(S.hebbrix_list(collection_id="c1"))
+    ids = [m["id"] for m in out["memories"]]
+    assert "m1" not in ids and "m2" in ids
+
+
+def test_list_replaces_stale_row_with_cached_update(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"id": "m1", "collection_id": "c1"}))
+    asyncio.run(S.hebbrix_update("m1", content="corrected value"))
+    _fake(monkeypatch, FakeResponse(200, {"items": [{"id": "m1", "content": "stale value"}]}))
+    out = asyncio.run(S.hebbrix_list(collection_id="c1"))
+    m1 = next(m for m in out["memories"] if m["id"] == "m1")
+    assert m1["content"] == "corrected value"
+
+
+# --- #7 collection scope + tombstone revival ---------------------------------
+def test_cached_update_overlay_is_collection_scoped(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"id": "m1", "collection_id": "c1"}))
+    asyncio.run(S.hebbrix_update("m1", content="borealis codename"))
+    _fake(monkeypatch, FakeResponse(200, {"results": []}))  # different collection
+    out = asyncio.run(S.hebbrix_search("borealis", collection_id="c2"))
+    assert all(r["id"] != "m1" for r in out["results"])  # not overlaid into c2
+
+
+def test_update_after_delete_revives_id(monkeypatch):
+    _fake(monkeypatch, FakeResponse(204))
+    asyncio.run(S.hebbrix_forget("m1"))
+    assert S._is_tombstoned("m1")
+    _fake(monkeypatch, FakeResponse(200, {"id": "m1", "collection_id": "c1"}))
+    asyncio.run(S.hebbrix_update("m1", content="reborn"))
+    assert not S._is_tombstoned("m1")
+    assert S._cached_write("m1")["content"] == "reborn"
+
+
+# --- #8 multi-tenant disables ALL process-global overlays --------------------
+def test_multi_tenant_disables_tombstones_and_overlay(monkeypatch):
+    monkeypatch.setattr(S, "_LOCAL_CACHE", False)
+    S._RECENT_WRITES.clear()
+    S._RECENT_DELETES.clear()
+    S._cache_put("m1", "x", "c1")
+    S._cache_delete("m2")
+    assert len(S._RECENT_WRITES) == 0 and len(S._RECENT_DELETES) == 0
+    assert S._is_tombstoned("m2") is False
+    assert S._overlay_recent_writes("c1", set(), query="x") == []
+
+
+# --- #9 handshake advertises the Hebbrix package version, not the SDK's -------
+def test_handshake_reports_hebbrix_version_not_sdk():
+    from importlib.metadata import version
+    sdk = version("mcp")
+    assert S.mcp._mcp_server.version == S._SERVER_VERSION
+    assert S.mcp._mcp_server.version != sdk

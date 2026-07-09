@@ -142,7 +142,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_list` - List recent memories.
 - `hebbrix_history` - See how a memory changed over time.
 
-**Knowledge graph** — reads work on every tier (including agent mode); graph writes/inference need a Pro plan.
+**Knowledge graph** — Hebbrix automatically extracts entities and relationships from the memories you write, on **every tier including agent mode**, so all the graph *reads* below (entities, timelines, traversal, contradictions) work in agent mode too. Only explicit graph *write* / inference operations require a Pro plan.
 
 - `hebbrix_search_entities` - List known entities (people, orgs, tools, places).
 - `hebbrix_entity_timeline` - What was true about an entity, and when.
@@ -243,7 +243,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 40 offline tests, no network needed
+pytest tests/ -q            # 55 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 

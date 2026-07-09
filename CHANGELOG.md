@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.3.10 — 2026-07-09
+
+Mutation-consistency fixes from an external correctness report. The 0.3.8
+write-behind cache handled `create` but not `update` or `delete`, so stale or
+deleted content could leak through immediately after a mutation.
+
+- **Update now reflects immediately (read-after-write for corrections).** The
+  session cache is keyed by memory id; a successful `hebbrix_update` replaces the
+  cached content, and `hebbrix_search`/`hebbrix_list` now REPLACE a stale remote
+  row that has the same id with the corrected content (previously the cache only
+  supplemented *missing* ids, so a lagging remote row won). `hebbrix_update`
+  gained `wait_for_index=True` (matches `hebbrix_remember`).
+- **Deletes are no longer resurrected.** `hebbrix_forget` now tombstones the id
+  (on a 2xx delete or a remote 404). `hebbrix_search` and `hebbrix_list` filter
+  tombstoned ids out of BOTH cached and remote results. A tombstone is cleared if
+  the id is re-created/updated.
+- **`hebbrix_get` can't return a deleted memory.** It checks the tombstone set
+  first and returns a structured `{"error":"not found","deleted":true}`;
+  `_cached_write` never falls back to a tombstoned id, so a remote 404 after a
+  delete no longer resurrects old cached content.
+- **Handshake reports the Hebbrix version.** `serverInfo.version` is now the
+  installed `hebbrix-mcp` version (via `importlib.metadata`) instead of the MCP
+  SDK version.
+- **Docs:** clarified that automatic graph extraction (entities/timelines/
+  traversal reads) works in agent mode; only explicit graph writes/inference
+  need Pro.
+- 15 new offline regressions (55 total), verified live against the real API
+  (create → update → search/get → delete → search/get).
+
+Multi-tenant hosted mode still disables all process-global overlays, so none of
+this can cross tenants.
+
 ## 0.3.9 — 2026-07-09
 
 Hosted-server support.

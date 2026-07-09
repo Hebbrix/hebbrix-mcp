@@ -77,20 +77,66 @@ _LAST_USAGE: ContextVar[Optional[dict]] = ContextVar("hebbrix_last_usage", defau
 # process. Local stdio (one user) is where the latency win matters anyway.       #
 # --------------------------------------------------------------------------- #
 _LOCAL_CACHE = not MULTI_TENANT
+# CURRENT content per memory id (one entry per id) — a create OR a successful
+# update lands here, so read-after-write always reflects the latest value.
 _RECENT_WRITES: deque = deque(maxlen=64)      # {id, content, collection_id, ts}
+# Ids deleted this session (or confirmed absent by a remote 404). A tombstoned
+# id must NEVER be surfaced again — not from the local cache and not from a
+# stale remote row that hasn't been reindexed yet.
+_RECENT_DELETES: deque = deque(maxlen=256)    # memory ids (strings)
 _RECENT_CONFIDENCE: deque = deque(maxlen=8)   # {query, recommended_action, ts}
 
 
-def _remember_write(mem_id: Any, content: Optional[str], collection_id: Optional[str]) -> None:
-    """Record a just-written memory so search/get/list can surface it instantly."""
-    if _LOCAL_CACHE and mem_id and content:
-        _RECENT_WRITES.append({"id": str(mem_id), "content": content,
-                               "collection_id": collection_id, "ts": time.time()})
+def _cache_put(mem_id: Any, content: Optional[str], collection_id: Optional[str]) -> None:
+    """Record the CURRENT content of a memory written or corrected this session,
+    keyed by id (one entry per id). Replaces the existing entry on update so a
+    later search/get/list returns the corrected content, and clears any tombstone
+    for the id (a re-create/update revives it)."""
+    if not (_LOCAL_CACHE and mem_id and content):
+        return
+    mid = str(mem_id)
+    while mid in _RECENT_DELETES:
+        try:
+            _RECENT_DELETES.remove(mid)
+        except ValueError:
+            break
+    for w in _RECENT_WRITES:
+        if w["id"] == mid:
+            w["content"] = content
+            if collection_id is not None:
+                w["collection_id"] = collection_id
+            w["ts"] = time.time()
+            return
+    _RECENT_WRITES.append({"id": mid, "content": content,
+                           "collection_id": collection_id, "ts": time.time()})
+
+
+def _cache_delete(mem_id: Any) -> None:
+    """Tombstone a memory id (delete succeeded, or remote confirmed a 404) so the
+    local overlay can't resurrect it and a stale remote row is filtered out. Only
+    call on a CONFIRMED absence — never on a transient/other error."""
+    if not (_LOCAL_CACHE and mem_id):
+        return
+    mid = str(mem_id)
+    for w in [x for x in _RECENT_WRITES if x["id"] == mid]:
+        try:
+            _RECENT_WRITES.remove(w)
+        except ValueError:
+            pass
+    if mid not in _RECENT_DELETES:
+        _RECENT_DELETES.append(mid)
+
+
+def _is_tombstoned(mem_id: Any) -> bool:
+    """True if this id was deleted this session — it must never be surfaced."""
+    return bool(_LOCAL_CACHE and mem_id is not None and str(mem_id) in _RECENT_DELETES)
 
 
 def _cached_write(mem_id: str) -> Optional[dict]:
-    """The locally-cached copy of a memory just written this session, if any."""
-    if not _LOCAL_CACHE:
+    """The locally-cached CURRENT copy of a memory written/corrected this session,
+    if any. NEVER returns a tombstoned (deleted) id — a remote 404 after a delete
+    must not fall back to stale cached content."""
+    if not _LOCAL_CACHE or _is_tombstoned(mem_id):
         return None
     for w in reversed(_RECENT_WRITES):
         if w["id"] == str(mem_id):
@@ -101,17 +147,17 @@ def _cached_write(mem_id: str) -> Optional[dict]:
 def _overlay_recent_writes(
     collection_id: Optional[str], existing_ids: set, query: Optional[str] = None
 ) -> list[dict]:
-    """Recent local writes matching the scope (and query, if given) that aren't
-    already in the remote result set. Guarantees read-after-write for search/list
-    even when the caller used wait_for_index=False or the remote index still lags.
-    Newest first. Query match is a lenient token-substring test (the just-written
-    text is verbatim, so an exact recall of it always matches)."""
+    """Recent local writes/corrections (in scope, matching query if given) whose
+    id the remote result set did NOT already return — prepended so a just-written
+    or just-corrected memory is recallable even before the remote index catches
+    up. Tombstoned ids are excluded. Newest first. Query match is a lenient
+    token-substring test (the stored text is verbatim, so exact recall matches)."""
     if not _LOCAL_CACHE:
         return []
     q_tokens = [t for t in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(t) >= 2]
     out = []
     for w in reversed(_RECENT_WRITES):
-        if w["id"] in existing_ids:
+        if w["id"] in existing_ids or _is_tombstoned(w["id"]):
             continue
         if collection_id and w.get("collection_id") and w["collection_id"] != collection_id:
             continue
@@ -161,6 +207,21 @@ All content stays scoped to the configured collection unless you pass collection
 """
 
 mcp = FastMCP("hebbrix", instructions=INSTRUCTIONS, host=HOST, port=PORT)
+
+# Advertise the Hebbrix package version in the MCP handshake (serverInfo), not
+# the MCP SDK version. FastMCP leaves the lowlevel Server.version unset, which
+# makes it fall back to importlib.metadata.version("mcp"); set it explicitly so
+# clients and bug reports identify the actual server release.
+try:
+    from importlib.metadata import version as _pkg_version
+
+    _SERVER_VERSION = _pkg_version("hebbrix-mcp")
+except Exception:  # not installed as a dist (running from a raw checkout)
+    _SERVER_VERSION = "0"
+try:
+    mcp._mcp_server.version = _SERVER_VERSION  # noqa: SLF001 (documented FastMCP internal)
+except Exception:
+    pass
 
 
 # --------------------------------------------------------------------------- #
@@ -435,7 +496,7 @@ async def hebbrix_remember(
         results = data.get("results") or []
         # Cache each extracted memory so it's locally recallable this session.
         for it in results:
-            _remember_write(it.get("id") or it.get("memory_id"), it.get("memory"), cid)
+            _cache_put(it.get("id") or it.get("memory_id"), it.get("memory"), cid)
         # /memories result items are {id, memory_id, event, memory, reason} —
         # the extracted text is under "memory", not "content".
         return _u({"id": data.get("id") or (results[0].get("id") or results[0].get("memory_id")
@@ -455,7 +516,7 @@ async def hebbrix_remember(
     data = await _post("/memories/raw", body)
     if "error" in data:
         return data
-    _remember_write(data.get("id"), content, cid)
+    _cache_put(data.get("id"), content, cid)
     return _u({"id": data.get("id"), "status": data.get("processing_status", "pending"),
                "importance": data.get("importance"), "searchable": wait_for_index})
 
@@ -477,27 +538,47 @@ async def hebbrix_search(
     data = await _post("/search", {"query": query, "collection_id": cid, "limit": limit})
     if "error" in data:
         return data
-    out = [{"id": i.get("memory_id"), "content": i.get("content"),
-            "score": round(i.get("score") or 0.0, 3)} for i in (data.get("results") or [])[:limit]]
-    # Read-after-write: surface anything just written this session that the remote
-    # index hasn't caught up to yet, so a write immediately followed by a search
-    # for it never comes back empty (even with wait_for_index=False).
-    seen = {r["id"] for r in out if r.get("id")}
+    # Reconcile remote results against this session's mutations so read-after-write
+    # holds for updates and deletes, not just creates:
+    #  - a tombstoned (deleted) id is dropped even if the remote index still has it
+    #  - a stale remote row is REPLACED by the corrected cached content (same id)
+    out: list[dict[str, Any]] = []
+    seen: set = set()
+    for i in (data.get("results") or []):
+        rid = i.get("memory_id")
+        if rid is not None and _is_tombstoned(rid):
+            continue
+        row = {"id": rid, "content": i.get("content"),
+               "score": round(i.get("score") or 0.0, 3)}
+        if rid is not None:
+            cw = _cached_write(rid)
+            if cw and cw.get("content") is not None:
+                row["content"] = cw["content"]  # cached correction wins over stale remote
+                row["corrected"] = True
+            seen.add(rid)
+        out.append(row)
+    # Prepend just-written/-corrected memories the remote index hasn't surfaced yet.
     for w in _overlay_recent_writes(cid, seen, query=query):
         out.insert(0, {"id": w["id"], "content": w["content"],
                        "score": 1.0, "just_written": True})
-    return _u({"query": query, "count": len(out), "results": out[:limit],
+    out = out[:limit]
+    return _u({"query": query, "count": len(out), "results": out,
             "processing_time_ms": data.get("processing_time_ms")})
 
 
 @mcp.tool()
 async def hebbrix_get(memory_id: str) -> dict[str, Any]:
     """Fetch one memory by id, including its full content and metadata."""
+    # A memory deleted this session is gone — never fall back to a cached copy
+    # or a stale remote row (that would turn an authoritative delete into an
+    # apparently-valid memory).
+    if _is_tombstoned(memory_id):
+        return _u({"error": "not found", "id": str(memory_id), "deleted": True})
     data = await _get(f"/memories/{memory_id}")
     if isinstance(data, dict) and "error" in data:
-        # Get-after-write: a memory written moments ago may not be readable
-        # remotely yet. Serve the local copy so the id we just handed back
-        # always resolves.
+        # Get-after-write: a memory written/corrected moments ago may not be
+        # readable remotely yet. Serve the local copy so the id we just handed
+        # back resolves. _cached_write already excludes tombstoned ids.
         w = _cached_write(memory_id)
         if w:
             return _u({"id": w["id"], "content": w["content"],
@@ -511,20 +592,39 @@ async def hebbrix_update(
     memory_id: str,
     content: Optional[str] = None,
     importance: Optional[float] = None,
+    wait_for_index: bool = True,
 ) -> dict[str, Any]:
     """Update a memory in place (keeps version history). Use this to CORRECT a
     stored fact instead of remembering a contradicting copy. Pass the new content.
+
+    wait_for_index=True (default): the correction is reflected in search/get/list
+    the moment this returns (read-after-write). Set False for fire-and-forget.
     """
     if content is None and importance is None:
         return {"error": "pass content and/or importance to update"}
-    data = await _patch(f"/memories/{memory_id}", {"content": content, "importance": importance})
-    return _u(data if "error" in data else _mem_row(data) | {"updated": True})
+    data = await _patch(f"/memories/{memory_id}", {
+        "content": content, "importance": importance, "wait_for_index": wait_for_index})
+    if isinstance(data, dict) and "error" in data:
+        return _u(data)
+    # Read-after-write for corrections: reflect the new content locally so
+    # search/get/list return it immediately even if the remote index lags. Keyed
+    # by id, so this REPLACES any earlier cached content for the same memory.
+    if content is not None:
+        _cache_put(memory_id, content, data.get("collection_id"))
+    return _u(_mem_row(data) | {"updated": True})
 
 
 @mcp.tool()
 async def hebbrix_forget(memory_id: str) -> dict[str, Any]:
     """Delete a memory by id."""
-    return _u(await _delete(f"/memories/{memory_id}"))
+    result = await _delete(f"/memories/{memory_id}")
+    # On a confirmed delete (2xx) OR a remote 404 (already gone), tombstone the id
+    # so it can't be resurrected this session by the local overlay or a stale
+    # remote row. Do NOT tombstone on any other failure (5xx / network).
+    status = result.get("status")
+    if result.get("ok") or status == 404:
+        _cache_delete(memory_id)
+    return _u(result)
 
 
 @mcp.tool()
@@ -537,12 +637,24 @@ async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> 
     if "error" in data:
         return data
     items = data.get("items") or data.get("memories") or (data if isinstance(data, list) else [])
-    rows = [{"id": m.get("id"), "content": (m.get("content") or "")[:160]} for m in items[:limit]]
-    # Read-after-write: prepend any just-written memory the remote list omits.
-    seen = {r["id"] for r in rows if r.get("id")}
+    # Same reconciliation as search: drop tombstoned ids, replace a stale remote
+    # row with the corrected cached content, then prepend not-yet-indexed writes.
+    rows: list[dict[str, Any]] = []
+    seen: set = set()
+    for m in items:
+        mid = m.get("id")
+        if mid is not None and _is_tombstoned(mid):
+            continue
+        content = m.get("content") or ""
+        if mid is not None:
+            cw = _cached_write(mid)
+            if cw and cw.get("content") is not None:
+                content = cw["content"]
+            seen.add(mid)
+        rows.append({"id": mid, "content": content[:160]})
     for w in _overlay_recent_writes(cid, seen):
         rows.insert(0, {"id": w["id"], "content": (w["content"] or "")[:160], "just_written": True})
-    return _u({"count": len(rows), "memories": rows[:limit]})
+    return _u({"count": len(rows[:limit]), "memories": rows[:limit]})
 
 
 @mcp.tool()
