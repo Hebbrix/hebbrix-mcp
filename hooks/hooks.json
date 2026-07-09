@@ -1,0 +1,26 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HEBBRIX_API_KEY=\"${user_config.api_key}\" HEBBRIX_COLLECTION_ID=\"${user_config.collection_id}\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.sh\"",
+            "timeout": 12
+          }
+        ]
+      },
+      {
+        "matcher": "resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "HEBBRIX_API_KEY=\"${user_config.api_key}\" HEBBRIX_COLLECTION_ID=\"${user_config.collection_id}\" \"${CLAUDE_PLUGIN_ROOT}/scripts/session-init.sh\"",
+            "timeout": 12
+          }
+        ]
+      }
+    ]
+  }
+}

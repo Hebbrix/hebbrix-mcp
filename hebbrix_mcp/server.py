@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
+import time
+from collections import deque
 from contextvars import ContextVar
 from pathlib import Path
 from typing import Any, Optional
@@ -56,6 +59,63 @@ CONFIG_PATH = Path(os.environ.get("HEBBRIX_CONFIG", "~/.hebbrix/config.json")).e
 # (not a module global) so concurrent requests in multi-tenant hosted mode never
 # cross-contaminate each other's usage block.
 _LAST_USAGE: ContextVar[Optional[dict]] = ContextVar("hebbrix_last_usage", default=None)
+
+# --------------------------------------------------------------------------- #
+# Local session cache — write-behind read-after-write + confidence->decision   #
+# auto-inference. The stdio server process lives for the whole session, so a    #
+# just-written memory stays locally recallable even before the remote index      #
+# catches up, and a confidence check can auto-fill the decision the agent logs   #
+# next. DISABLED in multi-tenant hosted mode (_LOCAL_CACHE=False) so one         #
+# tenant's writes or decisions can NEVER surface in another tenant's results —   #
+# the cache is process-global and hosted mode multiplexes many keys through one  #
+# process. Local stdio (one user) is where the latency win matters anyway.       #
+# --------------------------------------------------------------------------- #
+_LOCAL_CACHE = not MULTI_TENANT
+_RECENT_WRITES: deque = deque(maxlen=64)      # {id, content, collection_id, ts}
+_RECENT_CONFIDENCE: deque = deque(maxlen=8)   # {query, recommended_action, ts}
+
+
+def _remember_write(mem_id: Any, content: Optional[str], collection_id: Optional[str]) -> None:
+    """Record a just-written memory so search/get/list can surface it instantly."""
+    if _LOCAL_CACHE and mem_id and content:
+        _RECENT_WRITES.append({"id": str(mem_id), "content": content,
+                               "collection_id": collection_id, "ts": time.time()})
+
+
+def _cached_write(mem_id: str) -> Optional[dict]:
+    """The locally-cached copy of a memory just written this session, if any."""
+    if not _LOCAL_CACHE:
+        return None
+    for w in reversed(_RECENT_WRITES):
+        if w["id"] == str(mem_id):
+            return w
+    return None
+
+
+def _overlay_recent_writes(
+    collection_id: Optional[str], existing_ids: set, query: Optional[str] = None
+) -> list[dict]:
+    """Recent local writes matching the scope (and query, if given) that aren't
+    already in the remote result set. Guarantees read-after-write for search/list
+    even when the caller used wait_for_index=False or the remote index still lags.
+    Newest first. Query match is a lenient token-substring test (the just-written
+    text is verbatim, so an exact recall of it always matches)."""
+    if not _LOCAL_CACHE:
+        return []
+    q_tokens = [t for t in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(t) >= 2]
+    out = []
+    for w in reversed(_RECENT_WRITES):
+        if w["id"] in existing_ids:
+            continue
+        if collection_id and w.get("collection_id") and w["collection_id"] != collection_id:
+            continue
+        if q_tokens:
+            content_l = (w["content"] or "").lower()
+            if not any(t in content_l for t in q_tokens):
+                continue
+        out.append(w)
+    return out
+
 
 # A server-level instructions block teaches the model the data model and when to
 # reach for each tool. This is the single cheapest lever on agent behavior.
@@ -367,6 +427,9 @@ async def hebbrix_remember(
         if "error" in data:
             return data
         results = data.get("results") or []
+        # Cache each extracted memory so it's locally recallable this session.
+        for it in results:
+            _remember_write(it.get("id") or it.get("memory_id"), it.get("memory"), cid)
         # /memories result items are {id, memory_id, event, memory, reason} —
         # the extracted text is under "memory", not "content".
         return _u({"id": data.get("id") or (results[0].get("id") or results[0].get("memory_id")
@@ -386,6 +449,7 @@ async def hebbrix_remember(
     data = await _post("/memories/raw", body)
     if "error" in data:
         return data
+    _remember_write(data.get("id"), content, cid)
     return _u({"id": data.get("id"), "status": data.get("processing_status", "pending"),
                "importance": data.get("importance"), "searchable": wait_for_index})
 
@@ -409,7 +473,14 @@ async def hebbrix_search(
         return data
     out = [{"id": i.get("memory_id"), "content": i.get("content"),
             "score": round(i.get("score") or 0.0, 3)} for i in (data.get("results") or [])[:limit]]
-    return _u({"query": query, "count": len(out), "results": out,
+    # Read-after-write: surface anything just written this session that the remote
+    # index hasn't caught up to yet, so a write immediately followed by a search
+    # for it never comes back empty (even with wait_for_index=False).
+    seen = {r["id"] for r in out if r.get("id")}
+    for w in _overlay_recent_writes(cid, seen, query=query):
+        out.insert(0, {"id": w["id"], "content": w["content"],
+                       "score": 1.0, "just_written": True})
+    return _u({"query": query, "count": len(out), "results": out[:limit],
             "processing_time_ms": data.get("processing_time_ms")})
 
 
@@ -417,7 +488,16 @@ async def hebbrix_search(
 async def hebbrix_get(memory_id: str) -> dict[str, Any]:
     """Fetch one memory by id, including its full content and metadata."""
     data = await _get(f"/memories/{memory_id}")
-    return _u(data if "error" in data else _mem_row(data) | {"metadata": data.get("metadata")})
+    if isinstance(data, dict) and "error" in data:
+        # Get-after-write: a memory written moments ago may not be readable
+        # remotely yet. Serve the local copy so the id we just handed back
+        # always resolves.
+        w = _cached_write(memory_id)
+        if w:
+            return _u({"id": w["id"], "content": w["content"],
+                       "pending_index": True, "metadata": None})
+        return _u(data)
+    return _u(_mem_row(data) | {"metadata": data.get("metadata")})
 
 
 @mcp.tool()
@@ -451,8 +531,12 @@ async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> 
     if "error" in data:
         return data
     items = data.get("items") or data.get("memories") or (data if isinstance(data, list) else [])
-    return _u({"count": len(items), "memories": [
-        {"id": m.get("id"), "content": (m.get("content") or "")[:160]} for m in items[:limit]]})
+    rows = [{"id": m.get("id"), "content": (m.get("content") or "")[:160]} for m in items[:limit]]
+    # Read-after-write: prepend any just-written memory the remote list omits.
+    seen = {r["id"] for r in rows if r.get("id")}
+    for w in _overlay_recent_writes(cid, seen):
+        rows.insert(0, {"id": w["id"], "content": (w["content"] or "")[:160], "just_written": True})
+    return _u({"count": len(rows), "memories": rows[:limit]})
 
 
 @mcp.tool()
@@ -545,6 +629,12 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
     data = await _get("/confidence", {"query": query, "collection_id": _cid(collection_id)})
     if "error" in data:
         return data
+    # Remember this check so a decision logged right after can auto-link to it
+    # (the confidence -> action -> outcome loop) without the agent re-typing it.
+    if _LOCAL_CACHE:
+        _RECENT_CONFIDENCE.append({"query": query,
+                                   "recommended_action": data.get("recommended_action"),
+                                   "ts": time.time()})
     return _u({"confidence": data.get("confidence"),
             "recommended_action": data.get("recommended_action"),
             "answer_confidence": data.get("answer_confidence"),
@@ -554,20 +644,42 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
 
 @mcp.tool()
 async def hebbrix_log_decision(
-    description: str,
+    description: Optional[str] = None,
     outcome: Optional[str] = None,
     decision_type: Optional[str] = None,
     collection_id: Optional[str] = None,
 ) -> dict[str, Any]:
     """Record a decision the agent made and, if known, its outcome
     (success | failure | partial). This feeds hebbrix_confidence so future
-    recommendations improve. Log both the choice and how it turned out."""
+    recommendations improve. Log both the choice and how it turned out.
+
+    Shortcut: right after a hebbrix_confidence check you can log just the
+    outcome (e.g. outcome="success") with no description — it auto-fills from
+    the thing you just asked about, closing the confidence -> action -> outcome
+    loop with one call."""
+    auto_linked = False
+    # Auto-infer the decision from the most recent confidence check when the
+    # caller didn't spell it out (the common "I asked, I acted, here's how it
+    # went" pattern). Local stdio only — never cross tenants in hosted mode.
+    if _LOCAL_CACHE and not description and _RECENT_CONFIDENCE:
+        last = _RECENT_CONFIDENCE[-1]
+        description = f"Acted on: {last['query']}"
+        if not decision_type and last.get("recommended_action"):
+            decision_type = str(last["recommended_action"])
+        auto_linked = True
+    if not description:
+        return {"error": "pass a description (or call hebbrix_confidence first, "
+                         "then log just the outcome to auto-fill it)"}
     data = await _post("/decisions", {
         "description": description, "outcome": outcome, "decision_type": decision_type,
         "collection_id": _cid(collection_id)})
     if "error" in data:
         return data
-    return _u({"id": data.get("id") or data.get("decision_id"), "logged": True})
+    out = {"id": data.get("id") or data.get("decision_id"), "logged": True,
+           "description": description}
+    if auto_linked:
+        out["auto_linked_to_confidence"] = True
+    return _u(out)
 
 
 @mcp.tool()
@@ -731,6 +843,29 @@ def _cmd_claim(argv: list[str]) -> None:
     raise SystemExit("Too many attempts here — run the claim command again.")
 
 
+def _cmd_profile(argv: list[str]) -> None:
+    """`hebbrix-mcp profile` — print the compiled user profile as plain text.
+
+    Used by the Claude Code plugin's SessionStart hook to inject the user's
+    memory into every new session. Always exits 0 (prints "(none yet)" when the
+    profile is empty, no key is configured yet, or the API is briefly
+    unavailable) so a session-start hook can call it without ever failing."""
+    if not KEY:
+        _load_saved_credentials()
+    if not KEY:
+        print("(none yet)")
+        return
+    try:
+        r = httpx.get(f"{BASE}/profile/facts",
+                      headers={"Authorization": f"Bearer {KEY}"}, timeout=15.0)
+        if r.status_code >= 400:
+            print("(none yet)")
+            return
+        print(_profile_text(r.json()))
+    except Exception:
+        print("(none yet)")
+
+
 def run() -> None:
     """Console entry point. Serves MCP over stdio by default.
 
@@ -738,6 +873,7 @@ def run() -> None:
       hebbrix-mcp                                # stdio (Claude Desktop, Cursor, ...)
       hebbrix-mcp --transport streamable-http    # remote / self-hosted at HOST:PORT
       hebbrix-mcp claim --email <you>            # claim an auto-provisioned account
+      hebbrix-mcp profile                        # print compiled profile (plugin hook)
 
     Credentials, in order: HEBBRIX_API_KEY env var; saved ~/.hebbrix/config.json;
     otherwise AGENT MODE — a shadow account is minted automatically (no email,
@@ -745,6 +881,10 @@ def run() -> None:
     """
     if len(sys.argv) > 1 and sys.argv[1] == "claim":
         _cmd_claim(sys.argv[2:])
+        return
+
+    if len(sys.argv) > 1 and sys.argv[1] == "profile":
+        _cmd_profile(sys.argv[2:])
         return
 
     transport = "stdio"

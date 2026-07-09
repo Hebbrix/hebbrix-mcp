@@ -58,8 +58,12 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def reset_usage():
     S._LAST_USAGE.set(None)  # per-request ContextVar, cleared between tests
+    S._RECENT_WRITES.clear()  # process-global session caches — isolate each test
+    S._RECENT_CONFIDENCE.clear()
     yield
     S._LAST_USAGE.set(None)
+    S._RECENT_WRITES.clear()
+    S._RECENT_CONFIDENCE.clear()
 
 
 def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
@@ -333,3 +337,94 @@ def test_graph_query_requires_entity_and_lowercases(monkeypatch):
     # 'query' free-text param no longer exists on the tool
     import inspect
     assert "query" not in inspect.signature(S.hebbrix_graph_query).parameters
+
+
+# ---------------------------------------------- write-behind read-after-write
+def test_get_after_write_served_from_cache_on_remote_miss(monkeypatch):
+    # A memory written this session must resolve by id even if the remote
+    # read 404s (index not caught up yet).
+    S._remember_write("w1", "the launch is on Friday", "c1")
+    _fake(monkeypatch, FakeResponse(404, text="not found"))
+    out = asyncio.run(S.hebbrix_get("w1"))
+    assert out["id"] == "w1" and out["content"] == "the launch is on Friday"
+    assert out["pending_index"] is True
+
+
+def test_get_error_without_cache_still_returns_error(monkeypatch):
+    _fake(monkeypatch, FakeResponse(500, text="boom"))
+    out = asyncio.run(S.hebbrix_get("never-written"))
+    assert out["error"].startswith("HTTP 500")
+
+
+def test_search_overlays_just_written_memory(monkeypatch):
+    S._remember_write("w1", "the sky is blue today", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "remote1", "content": "unrelated", "score": 0.4}]}))
+    out = asyncio.run(S.hebbrix_search("sky", collection_id="c1", limit=5))
+    ids = [r["id"] for r in out["results"]]
+    assert "w1" in ids
+    top = next(r for r in out["results"] if r["id"] == "w1")
+    assert top["just_written"] is True
+
+
+def test_search_overlay_respects_collection_and_query(monkeypatch):
+    S._remember_write("w1", "cats are great", "OTHER")   # wrong collection
+    S._remember_write("w2", "dogs are loud", "c1")        # right collection, no match
+    _fake(monkeypatch, FakeResponse(200, {"results": []}))
+    out = asyncio.run(S.hebbrix_search("elephant", collection_id="c1"))
+    assert out["results"] == []  # neither matches scope+query
+
+
+def test_search_overlay_dedupes_already_returned(monkeypatch):
+    S._remember_write("remote1", "the sky is blue", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "remote1", "content": "the sky is blue", "score": 0.9}]}))
+    out = asyncio.run(S.hebbrix_search("sky", collection_id="c1"))
+    assert [r["id"] for r in out["results"]].count("remote1") == 1
+
+
+def test_list_overlays_just_written(monkeypatch):
+    S._remember_write("w1", "fresh memory", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"items": []}))
+    out = asyncio.run(S.hebbrix_list(collection_id="c1"))
+    assert any(m["id"] == "w1" and m.get("just_written") for m in out["memories"])
+
+
+def test_multi_tenant_disables_local_cache(monkeypatch):
+    monkeypatch.setattr(S, "_LOCAL_CACHE", False)
+    S._RECENT_WRITES.clear()
+    S._remember_write("w1", "should not cache", "c1")
+    assert len(S._RECENT_WRITES) == 0
+    assert S._cached_write("w1") is None
+
+
+# ------------------------------------------------- auto-inferred decisions
+def test_confidence_is_recorded_for_auto_infer(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"confidence": 0.8, "recommended_action": "act"}))
+    asyncio.run(S.hebbrix_confidence("should I ship the release?", collection_id="c1"))
+    assert S._RECENT_CONFIDENCE[-1]["query"] == "should I ship the release?"
+    assert S._RECENT_CONFIDENCE[-1]["recommended_action"] == "act"
+
+
+def test_log_decision_auto_fills_from_last_confidence(monkeypatch):
+    S._RECENT_CONFIDENCE.append({"query": "ship the release?",
+                                 "recommended_action": "act", "ts": 0.0})
+    _fake(monkeypatch, FakeResponse(201, {"id": "d1"}))
+    out = asyncio.run(S.hebbrix_log_decision(outcome="success", collection_id="c1"))
+    assert out["logged"] is True
+    assert out["description"] == "Acted on: ship the release?"
+    assert out["auto_linked_to_confidence"] is True
+
+
+def test_log_decision_without_description_or_context_errors(monkeypatch):
+    _fake(monkeypatch, FakeResponse(201, {"id": "d1"}))
+    out = asyncio.run(S.hebbrix_log_decision(outcome="success", collection_id="c1"))
+    assert "error" in out
+
+
+def test_log_decision_explicit_description_not_overwritten(monkeypatch):
+    S._RECENT_CONFIDENCE.append({"query": "ship?", "recommended_action": "act", "ts": 0.0})
+    client = _fake(monkeypatch, FakeResponse(201, {"id": "d1"}))
+    asyncio.run(S.hebbrix_log_decision(description="Chose Postgres over Mongo",
+                                       collection_id="c1"))
+    assert client.calls[-1][2]["json"]["description"] == "Chose Postgres over Mongo"

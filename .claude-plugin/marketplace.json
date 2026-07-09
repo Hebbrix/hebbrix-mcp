@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace.json",
+  "name": "hebbrix",
+  "owner": { "name": "Hebbrix", "email": "contact@hebbrix.com" },
+  "description": "Official Hebbrix plugin for Claude Code — persistent memory and a temporal knowledge graph.",
+  "version": "0.3.7",
+  "plugins": [
+    {
+      "name": "hebbrix",
+      "displayName": "Hebbrix Memory",
+      "description": "Persistent long-term memory + temporal knowledge graph. Auto-loads your profile into every session.",
+      "version": "0.3.7",
+      "author": { "name": "Hebbrix" },
+      "homepage": "https://www.hebbrix.com",
+      "repository": "https://github.com/Hebbrix/hebbrix-mcp",
+      "license": "MIT",
+      "source": ".",
+      "keywords": ["memory", "knowledge-graph", "mcp"],
+      "category": "integration"
+    }
+  ]
+}

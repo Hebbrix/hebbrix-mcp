@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "hebbrix",
+  "displayName": "Hebbrix Memory",
+  "version": "0.3.7",
+  "description": "Persistent long-term memory + temporal knowledge graph for Claude Code. Auto-loads your compiled profile into every session and gives Claude tools to remember, search, and reason over what matters.",
+  "author": { "name": "Hebbrix", "email": "contact@hebbrix.com" },
+  "homepage": "https://www.hebbrix.com",
+  "repository": "https://github.com/Hebbrix/hebbrix-mcp",
+  "license": "MIT",
+  "keywords": ["memory", "knowledge-graph", "mcp", "hebbrix", "long-term-memory"],
+  "mcpServers": {
+    "hebbrix": {
+      "command": "uvx",
+      "args": ["hebbrix-mcp"],
+      "env": {
+        "HEBBRIX_API_KEY": "${user_config.api_key}",
+        "HEBBRIX_COLLECTION_ID": "${user_config.collection_id}"
+      }
+    }
+  },
+  "hooks": "./hooks/hooks.json",
+  "userConfig": {
+    "api_key": {
+      "type": "string",
+      "title": "Hebbrix API key",
+      "description": "Optional. Leave blank to run in free agent mode (an account is minted automatically, no email needed). Get a key at hebbrix.com/dashboard/api-keys.",
+      "sensitive": true,
+      "required": false
+    },
+    "collection_id": {
+      "type": "string",
+      "title": "Default collection",
+      "description": "Optional. Default memory space for writes/reads. Agent mode sets one automatically.",
+      "required": false
+    }
+  }
+}

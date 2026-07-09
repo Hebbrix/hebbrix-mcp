@@ -42,6 +42,22 @@ The free agent account includes **300 learning events** and **2,000 retrievals**
 uvx hebbrix-mcp claim --email you@example.com
 ```
 
+## Claude Code plugin (recommended)
+
+Install as a Claude Code **plugin** and Claude starts every session already
+knowing you — a `SessionStart` hook auto-loads your compiled Hebbrix profile
+into context, and the memory tools are wired up in one step:
+
+```bash
+/plugin marketplace add Hebbrix/hebbrix-mcp
+/plugin install hebbrix@hebbrix
+```
+
+That's it. No account needed (agent mode mints one on first run); set your
+`api_key` in the plugin config to use your own account instead. The hook degrades
+gracefully — a brand-new profile just shows `(none yet)` until you've saved a few
+facts, and it never blocks a session.
+
 ## Configuration
 
 Get an API key at [hebbrix.com/dashboard/api-keys](https://www.hebbrix.com/dashboard/api-keys) to use your own account instead of agent mode.
@@ -219,7 +235,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 26 offline tests, no network needed
+pytest tests/ -q            # 37 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 

@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.8 — 2026-07-09
+
+New features.
+
+- **Claude Code plugin.** The repo is now an installable Claude Code plugin +
+  single-plugin marketplace. `/plugin marketplace add Hebbrix/hebbrix-mcp` then
+  `/plugin install hebbrix@hebbrix` wires up the MCP server AND a `SessionStart`
+  hook that auto-loads your compiled Hebbrix profile into every session — Claude
+  starts each session already knowing your durable facts. See the README.
+- **`hebbrix-mcp profile` CLI.** Prints the compiled profile as plain text
+  (used by the plugin's session hook; always exits 0).
+- **Write-behind read-after-write cache (local/stdio).** A memory written this
+  session is instantly recallable by `hebbrix_search` / `hebbrix_get` /
+  `hebbrix_list` even before the remote index catches up — so you can safely use
+  `wait_for_index=False` for speed without a just-written fact ever going
+  missing. Disabled in multi-tenant hosted mode so one tenant's writes can never
+  surface in another's results.
+- **Auto-inferred decisions.** After a `hebbrix_confidence` check you can log
+  just the outcome (`hebbrix_log_decision(outcome="success")`) with no
+  description — it auto-fills from what you just asked about, closing the
+  confidence → action → outcome loop in one call.
+
 ## 0.3.7 — 2026-07-09
 
 Fixes from two external code reviews.
