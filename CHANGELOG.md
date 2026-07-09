@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.6 — 2026-07-09
+
+- Fix: `hebbrix_remember(extract=True)` returned each extracted memory's content
+  as null. The `/memories` result items carry the text under `memory` (not
+  `content`); the reshaping now reads the right key and also surfaces each
+  fact's `event` (ADD/UPDATE) and id. Data was always stored correctly — this
+  was display-only.
+- Docs: `hebbrix_remember` now advises using one `extract=True` call (or
+  `wait_for_index=False`) when saving several facts, since blocking writes are
+  serial (~a few seconds each).
+
+
 ## 0.3.5 — 2026-07-09
 
 Fixes from external integrator feedback.

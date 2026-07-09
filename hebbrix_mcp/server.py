@@ -341,6 +341,10 @@ async def hebbrix_remember(
     wait_for_index=True (default): the memory is searchable the moment this
       returns (read-after-write). Set False for fire-and-forget bulk writes.
 
+    Saving several facts at once? Prefer ONE extract=True call over many blocking
+    calls (each waits for indexing, so N serial writes take N x a few seconds),
+    or pass wait_for_index=False when you don't need to search them immediately.
+
     Returns {"id", "status", ...} or {"error"}.
     """
     cid = _cid(collection_id)
@@ -356,10 +360,15 @@ async def hebbrix_remember(
         if "error" in data:
             return data
         results = data.get("results") or []
-        return _u({"id": data.get("id") or (results[0].get("id") if results else None),
+        # /memories result items are {id, memory_id, event, memory, reason} —
+        # the extracted text is under "memory", not "content".
+        return _u({"id": data.get("id") or (results[0].get("id") or results[0].get("memory_id")
+                                             if results else None),
                    "extracted": data.get("created_count"),
                    "updated": data.get("updated_count"),
-                   "memories": [{"id": it.get("id"), "content": it.get("content")}
+                   "memories": [{"id": it.get("id") or it.get("memory_id"),
+                                 "content": it.get("memory"),
+                                 "event": it.get("event")}
                                 for it in results[:10]],
                    "status": data.get("processing_status", "pending"),
                    "searchable": wait_for_index})

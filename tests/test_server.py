@@ -261,14 +261,21 @@ def test_remember_default_is_raw_with_wait_for_index(monkeypatch):
 
 
 def test_remember_extract_routes_to_smart_endpoint(monkeypatch):
-    client = _fake(monkeypatch, FakeResponse(200, {"id": "p1", "created_count": 2,
-                                                   "updated_count": 0}))
+    client = _fake(monkeypatch, FakeResponse(200, {"created_count": 2, "updated_count": 0,
+        "results": [
+            {"id": "m1", "memory_id": "m1", "event": "ADD", "memory": "Sam is a designer."},
+            {"id": "m2", "memory_id": "m2", "event": "ADD", "memory": "Sam is in Oslo."},
+        ]}))
     out = asyncio.run(S.hebbrix_remember("messy multi-fact text", collection_id="c1",
                                          extract=True))
     _, url, kw = client.calls[-1]
     assert url.endswith("/memories") and not url.endswith("/memories/raw")
     assert kw["json"]["infer"] is True
     assert out["extracted"] == 2
+    # content must come from the "memory" key, not "content" (was returning null)
+    assert out["memories"][0]["content"] == "Sam is a designer."
+    assert out["memories"][0]["event"] == "ADD"
+    assert out["id"] == "m1"  # parent id null -> falls back to first result id
 
 
 def test_remember_wait_for_index_false_passthrough(monkeypatch):
