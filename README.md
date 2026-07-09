@@ -185,7 +185,16 @@ HEBBRIX_API_KEY=mem_sk_... uvx hebbrix-mcp --transport streamable-http
 # serves http://127.0.0.1:8080/mcp
 ```
 
-**Hosted multi-tenant — one instance, many users.** The server holds no key; every request authenticates with its own `Authorization` header:
+**Hosted — nothing to run.** Point any HTTP-capable MCP client at the official hosted endpoint and authenticate with your own key (get one at [hebbrix.com/dashboard/api-keys](https://www.hebbrix.com/dashboard/api-keys)):
+
+```json
+{ "mcpServers": { "hebbrix": {
+  "url": "https://mcp.hebbrix.com/mcp",
+  "headers": { "Authorization": "Bearer mem_sk_..." }
+}}}
+```
+
+**Self-hosted multi-tenant — one instance, many users.** Same shape on your own infra. The server holds no key; every request authenticates with its own `Authorization` header:
 
 ```bash
 HEBBRIX_MCP_MULTI_TENANT=1 HEBBRIX_MCP_HOST=0.0.0.0 uvx hebbrix-mcp --transport streamable-http
@@ -195,13 +204,6 @@ Or run the container (multi-tenant by default, `GET /healthz` for load-balancer 
 
 ```bash
 docker build -t hebbrix-mcp . && docker run -p 8080:8080 hebbrix-mcp
-```
-
-```json
-{ "mcpServers": { "hebbrix": {
-  "url": "https://your-host/mcp",
-  "headers": { "Authorization": "Bearer mem_sk_..." }
-}}}
 ```
 
 In multi-tenant mode there is no default collection — pass `collection_id` on tool calls.
