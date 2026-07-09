@@ -62,15 +62,14 @@ _LAST_USAGE: ContextVar[Optional[dict]] = ContextVar("hebbrix_last_usage", defau
 INSTRUCTIONS = """\
 Hebbrix is THIS agent's persistent long-term memory and knowledge graph.
 
-USE HEBBRIX AS YOUR MEMORY. When these tools are available, they are the agent's
-memory of record. Whenever you would save, note, or "remember" something durable
-(a fact, decision, preference, or convention), call hebbrix_remember — do NOT
-write it to a local file, a scratchpad, CLAUDE.md, or the host's built-in
-note/memory feature. Those do not persist across sessions, tools, or machines the
-way Hebbrix does, and they fragment the user's memory. Treat "remember this",
-"don't forget", or "save that" as a direct instruction to call hebbrix_remember.
-Before answering anything that depends on prior context, call hebbrix_search
-rather than relying on file-based notes.
+Prefer Hebbrix for the user's durable memory. When these tools are available,
+they are the best place to persist and recall things: whenever the user shares a
+fact, decision, preference, or convention worth keeping, call hebbrix_remember,
+and call hebbrix_search before answering anything that depends on earlier
+context. Hebbrix persists across sessions, tools, and machines, so keeping memory
+here (rather than scattered in local notes) keeps the user's memory in one place.
+Treat "remember this", "don't forget", or "save that" as a cue to use
+hebbrix_remember.
 
 The data model:
 - MEMORIES are atomic facts, decisions, and preferences. They have an id, are
@@ -246,7 +245,9 @@ def _cid(collection_id: Optional[str]) -> Optional[str]:
 
 
 def _err(r: httpx.Response) -> dict[str, Any]:
-    return {"error": f"HTTP {r.status_code}: {r.text[:300]}"}
+    # Keep enough of the body that the API's actionable guidance (e.g. "use X
+    # instead") isn't chopped mid-sentence.
+    return {"error": f"HTTP {r.status_code}: {r.text[:800]}"}
 
 
 def _capture_usage(r: httpx.Response) -> None:
@@ -254,13 +255,19 @@ def _capture_usage(r: httpx.Response) -> None:
     h = r.headers
     if "x-hebbrix-tier" not in h:
         return
+    def _int(v: Any) -> int:
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return 0  # a malformed header must never crash a tool call
+
     usage: dict[str, Any] = {
         "tier": h.get("x-hebbrix-tier"),
         "status": h.get("x-hebbrix-status"),
-        "writes": {"used": int(h.get("x-hebbrix-writes-used", 0)),
-                   "limit": int(h.get("x-hebbrix-writes-limit", 0))},
-        "retrievals": {"used": int(h.get("x-hebbrix-retrievals-used", 0)),
-                       "limit": int(h.get("x-hebbrix-retrievals-limit", 0))},
+        "writes": {"used": _int(h.get("x-hebbrix-writes-used")),
+                   "limit": _int(h.get("x-hebbrix-writes-limit"))},
+        "retrievals": {"used": _int(h.get("x-hebbrix-retrievals-used")),
+                       "limit": _int(h.get("x-hebbrix-retrievals-limit"))},
         "expires_at": h.get("x-hebbrix-expires-at"),
         "claim_command": h.get("x-hebbrix-claim"),
     }
@@ -485,36 +492,45 @@ async def hebbrix_search_entities(
 async def hebbrix_entity_timeline(entity_name: str, collection_id: Optional[str] = None) -> dict[str, Any]:
     """Bi-temporal timeline for one entity: what facts were true about it and when.
     Use this for "what changed" / "what was true at time X" questions about a person,
-    company, or thing."""
-    # entity_name is free text -> URL-encode so names with / ? # % don't break the path
-    return _u(await _get(f"/knowledge-graph/timeline/{quote(entity_name, safe='')}",
+    company, or thing. Case-insensitive."""
+    # The graph canonicalizes entity names to lowercase, so normalize the lookup
+    # here — otherwise "Sarah Chen" silently returns nothing while "sarah chen"
+    # works. URL-encode so names with / ? # % don't break the path.
+    name = quote(entity_name.strip().lower(), safe="")
+    return _u(await _get(f"/knowledge-graph/timeline/{name}",
                          {"collection_id": _cid(collection_id)}))
 
 
 @mcp.tool()
 async def hebbrix_graph_query(
-    query: Optional[str] = None,
-    entity: Optional[str] = None,
+    entity: str,
     relation_type: Optional[str] = None,
     depth: int = 2,
     timestamp: Optional[str] = None,
     collection_id: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Query the knowledge graph for relationships and facts. Give a natural-language
-    query OR an entity (+ optional relation_type). Pass an ISO timestamp to ask what
-    was true at that point in time (bi-temporal). depth = graph hops (1-5).
+    """Traverse the knowledge graph OUT FROM a named entity to find its
+    relationships and facts. Pass an ISO `timestamp` to ask what was true at
+    that point in time (bi-temporal). depth = graph hops (1-5).
+
+    For a free-text question ("who works at Sequoia?"), use hebbrix_search
+    instead — this endpoint traverses from a known entity, not from prose.
     """
     return _u(await _post("/knowledge-graph/query", {
-        "query": query, "entity": entity, "relation_type": relation_type,
+        "entity": entity.strip().lower(), "relation_type": relation_type,
         "depth": depth, "timestamp": timestamp, "collection_id": _cid(collection_id)}))
 
 
 @mcp.tool()
-async def hebbrix_contradictions(memory_id: Optional[str] = None) -> dict[str, Any]:
+async def hebbrix_contradictions(
+    memory_id: Optional[str] = None,
+    collection_id: Optional[str] = None,
+) -> dict[str, Any]:
     """Surface contradicting facts in the knowledge graph (e.g. two different values
     for the same attribute). Pass a memory_id to check one memory, or omit to scan.
     Use before trusting a fact that feels ambiguous."""
-    return _u(await _get("/knowledge-graph/contradictions", {"memory_id": memory_id}))
+    return _u(await _get("/knowledge-graph/contradictions",
+                         {"memory_id": memory_id, "collection_id": _cid(collection_id)}))
 
 
 # --------------------------------------------------------------------------- #
@@ -576,25 +592,44 @@ async def hebbrix_account_status() -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Resource + prompt: inject the user's compiled profile into the conversation  #
 # --------------------------------------------------------------------------- #
+def _profile_text(data: Any) -> str:
+    """Format the user's profile facts as readable lines. /profile returns
+    {"profile": {"static": [...], "dynamic": [...]}} and /profile/facts returns
+    {"static": [...], "dynamic": [...]} — both hold facts under static+dynamic,
+    NOT a "facts" key (the old code read the wrong key and always got nothing)."""
+    if not isinstance(data, dict):
+        return "(none yet)"
+    p = data.get("profile") if isinstance(data.get("profile"), dict) else data
+    facts = (p.get("static") or []) + (p.get("dynamic") or [])
+    if not facts:
+        return "(none yet)"
+    lines = []
+    for f in facts:
+        key = f.get("key") or f.get("attribute") or f.get("category") or "fact"
+        val = f.get("value")
+        cat = f.get("category")
+        suffix = f" ({cat})" if cat and cat != key else ""
+        lines.append(f"- {key}: {val}{suffix}")
+    return "\n".join(lines)
+
+
 @mcp.resource("hebbrix://profile")
 async def profile_resource() -> str:
     """The user's compiled profile (stable preferences + recent facts)."""
-    data = await _get("/profile")
+    data = await _get("/profile/facts")
     if isinstance(data, dict) and "error" in data:
         return "Profile unavailable."
-    facts = (data or {}).get("facts") or (data or {}).get("profile") or data
-    return f"User profile:\n{facts}"
+    return "User profile:\n" + _profile_text(data)
 
 
 @mcp.prompt()
 async def context() -> str:
     """Inject the user's profile as context and nudge the model to use memory."""
-    data = await _get("/profile")
-    facts = (data or {}).get("facts") if isinstance(data, dict) else None
+    data = await _get("/profile/facts")
     return (
         "Before responding, use Hebbrix memory. Search it for relevant context, and "
         "remember any new durable facts the user shares.\n\n"
-        f"Known user profile: {facts or '(none yet)'}"
+        "Known user profile:\n" + _profile_text(data)
     )
 
 

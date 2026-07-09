@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.7 — 2026-07-09
+
+Fixes from two external code reviews.
+
+- **Profile resource + `context` prompt were dead.** Both read a `facts` key
+  that `/profile` never returns. They now call `/profile/facts` and render the
+  compiled `static`/`dynamic` facts via a shared `_profile_text` helper (and say
+  `(none yet)` while the profile is still compiling instead of showing nothing).
+- **`hebbrix_graph_query` took a `query` it ignored.** The graph endpoint
+  traverses relationships out from a named entity, it does not do free-text
+  search. Removed the misleading `query` param; the tool now takes `entity`
+  (+ `relation_type`, `depth`, `timestamp`), and the docstring points free-text
+  questions at `hebbrix_search`.
+- **`hebbrix_entity_timeline` now lowercases the entity name** before
+  URL-encoding it, matching how entities are canonicalized server-side, so
+  `Acme Corp` and `acme corp` resolve to the same timeline.
+- **`hebbrix_contradictions` accepts `collection_id`** so it works under hosted
+  multi-tenant mode (no default collection).
+- **Usage capture no longer throws on malformed headers**, and error bodies are
+  surfaced up to 800 chars (was 300) for easier debugging.
+- Softened the server instruction block from a hard "do NOT write to local
+  files" directive to "prefer Hebbrix … keeps memory in one place."
+- Test suite expanded to 26 offline tests; CI now runs `ruff`.
+
 ## 0.3.6 — 2026-07-09
 
 - Fix: `hebbrix_remember(extract=True)` returned each extracted memory's content

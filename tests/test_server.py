@@ -205,7 +205,6 @@ def test_multi_tenant_client_never_uses_global_key(monkeypatch):
 
 def test_entity_timeline_url_encodes_name(monkeypatch):
     captured = {}
-    orig = S._get
     async def spy(path, params=None):
         captured["path"] = path
         return {"ok": True}
@@ -213,7 +212,8 @@ def test_entity_timeline_url_encodes_name(monkeypatch):
     import asyncio
     asyncio.run(S.hebbrix_entity_timeline("Acme/Corp?x#y", collection_id="c1"))
     assert "Acme/Corp?x#y" not in captured["path"]
-    assert "Acme%2FCorp%3Fx%23y" in captured["path"]
+    # lowercased (graph canonicalizes) + percent-encoded
+    assert "acme%2Fcorp%3Fx%23y" in captured["path"]
 
 
 def test_load_saved_credentials_reads_api_base(monkeypatch, tmp_path):
@@ -286,6 +286,50 @@ def test_remember_wait_for_index_false_passthrough(monkeypatch):
 
 def test_instructions_tell_model_to_prefer_hebbrix_over_files():
     ins = S.INSTRUCTIONS.lower()
-    assert "use hebbrix as your memory" in ins
-    assert "do not write it to a local file" in ins or "do not" in ins
-    assert "claude.md" in ins  # explicitly names the host-native memory surface
+    assert "prefer hebbrix" in ins
+    assert "hebbrix_remember" in ins and "hebbrix_search" in ins
+    assert "one place" in ins  # cooperative framing, not an absolute override
+
+
+# ------------------------- profile prompt/resource (v0.3.7) -----------------
+def test_profile_text_reads_static_and_dynamic():
+    data = {"profile": {
+        "static": [{"key": "home_city", "value": "Oslo", "category": "location"}],
+        "dynamic": [{"key": "current_task", "value": "launch", "category": "work"}]}}
+    txt = S._profile_text(data)
+    assert "home_city: Oslo (location)" in txt
+    assert "current_task: launch (work)" in txt
+
+
+def test_profile_text_handles_flat_facts_shape():
+    data = {"static": [{"key": "role", "value": "founder"}], "dynamic": []}
+    assert "role: founder" in S._profile_text(data)
+
+
+def test_profile_text_empty_is_none_yet():
+    assert S._profile_text({"static": [], "dynamic": []}) == "(none yet)"
+
+
+def test_context_prompt_injects_profile_facts(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"static": [{"key": "lang", "value": "Rust"}],
+                                          "dynamic": []}))
+    out = asyncio.run(S.context())
+    body = out.split("Known user profile:")[-1]
+    assert "lang: Rust" in body and "(none yet)" not in body
+
+
+def test_usage_capture_survives_malformed_headers(monkeypatch):
+    headers = {"X-Hebbrix-Tier": "shadow", "X-Hebbrix-Status": "ok",
+               "X-Hebbrix-Writes-Used": "not-a-number", "X-Hebbrix-Writes-Limit": ""}
+    _fake(monkeypatch, FakeResponse(201, {"id": "m1"}, headers=headers))
+    out = asyncio.run(S.hebbrix_remember("f", collection_id="c1"))  # must not raise
+    assert out["hebbrix_usage"]["writes"] == {"used": 0, "limit": 0}
+
+
+def test_graph_query_requires_entity_and_lowercases(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"nodes": []}))
+    asyncio.run(S.hebbrix_graph_query(entity="Sarah Chen", collection_id="c1"))
+    assert client.calls[-1][2]["json"]["entity"] == "sarah chen"  # lowercased
+    # 'query' free-text param no longer exists on the tool
+    import inspect
+    assert "query" not in inspect.signature(S.hebbrix_graph_query).parameters

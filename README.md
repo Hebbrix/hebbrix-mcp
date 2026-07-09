@@ -116,7 +116,8 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_remember` - Store a fact, decision, or preference.
     - `content` (string, required): the memory text
     - `tags` (list, optional), `collection_id` (string, optional)
-    - `verbatim` (bool, optional): store exactly as given, skip fact-extraction
+    - `extract` (bool, default false): false stores the text exactly (one memory); true runs fact-extraction and may create several atomic memories
+    - `wait_for_index` (bool, default true): searchable the moment the call returns
 - `hebbrix_search` - Semantic search (hybrid vector + BM25 + graph retrieval).
     - `query` (string, required), `limit` (int, optional), `collection_id` (string, optional)
 - `hebbrix_get` - Fetch one memory by id, with metadata.
@@ -129,7 +130,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
 
 - `hebbrix_search_entities` - List known entities (people, orgs, tools, places).
 - `hebbrix_entity_timeline` - What was true about an entity, and when.
-- `hebbrix_graph_query` - Query relationships; pass a `timestamp` to ask about a point in time.
+- `hebbrix_graph_query` - Traverse relationships out from a named entity; pass a `timestamp` for point-in-time truth. (Free-text questions: use `hebbrix_search`.)
 - `hebbrix_contradictions` - Surface facts that conflict with each other.
 
 **Reasoning & account**
@@ -218,7 +219,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 11 offline tests, no network needed
+pytest tests/ -q            # 26 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 
