@@ -1,0 +1,17 @@
+venv/
+.venv/
+dist/
+build/
+*.egg-info/
+__pycache__/
+*.pyc
+.git/
+.github/
+.pytest_cache/
+.ruff_cache/
+tests/
+.claude-plugin/
+hooks/
+scripts/
+*.md
+!README.md

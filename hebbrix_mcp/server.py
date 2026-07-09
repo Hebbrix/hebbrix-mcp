@@ -759,6 +759,17 @@ class _HeaderAuthMiddleware:
 
     async def __call__(self, scope, receive, send):
         if scope.get("type") == "http":
+            # Health-probe bypass: a hosted load balancer needs an
+            # unauthenticated 200. Scoped to GET /healthz|/health so it can
+            # never expose an MCP endpoint without a bearer.
+            if scope.get("method") == "GET" and scope.get("path", "") in ("/healthz", "/health"):
+                body = b'{"status":"ok","service":"hebbrix-mcp"}'
+                await send({"type": "http.response.start", "status": 200, "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode()),
+                ]})
+                await send({"type": "http.response.body", "body": body})
+                return
             headers = {k.decode().lower(): v.decode()
                        for k, v in (scope.get("headers") or [])}
             auth = headers.get("authorization", "")

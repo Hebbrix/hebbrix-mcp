@@ -428,3 +428,44 @@ def test_log_decision_explicit_description_not_overwritten(monkeypatch):
     asyncio.run(S.hebbrix_log_decision(description="Chose Postgres over Mongo",
                                        collection_id="c1"))
     assert client.calls[-1][2]["json"]["description"] == "Chose Postgres over Mongo"
+
+
+# ----------------------------------------------- hosted health-probe bypass
+def _run_mw(method, path, headers=None):
+    sent = []
+
+    async def inner(scope, receive, send):
+        # Record that the inner MCP app was reached (should NOT happen for a
+        # health probe or an unauthenticated request).
+        sent.append({"type": "INNER_APP_CALLED"})
+
+    async def receive():
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(msg):
+        sent.append(msg)
+
+    mw = S._HeaderAuthMiddleware(inner)
+    scope = {"type": "http", "method": method, "path": path,
+             "headers": [(k.encode(), v.encode()) for k, v in (headers or {}).items()]}
+    asyncio.run(mw(scope, receive, send))
+    return sent
+
+
+def test_health_probe_returns_200_without_auth():
+    sent = _run_mw("GET", "/healthz")
+    start = next(m for m in sent if m.get("type") == "http.response.start")
+    assert start["status"] == 200
+    assert not any(m.get("type") == "INNER_APP_CALLED" for m in sent)
+
+
+def test_missing_bearer_still_401():
+    sent = _run_mw("POST", "/mcp")
+    start = next(m for m in sent if m.get("type") == "http.response.start")
+    assert start["status"] == 401
+    assert not any(m.get("type") == "INNER_APP_CALLED" for m in sent)
+
+
+def test_valid_bearer_reaches_inner_app():
+    sent = _run_mw("POST", "/mcp", headers={"authorization": "Bearer mem_sk_x"})
+    assert any(m.get("type") == "INNER_APP_CALLED" for m in sent)

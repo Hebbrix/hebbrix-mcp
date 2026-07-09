@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hebbrix-mcp"
-version = "0.3.8"
+version = "0.3.9"
 description = "Hebbrix MCP server — long-term memory and knowledge graph for any MCP-compatible agent (Claude Desktop, Cline, Cursor, etc.)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -45,6 +45,10 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "ruff>=0.5",
+]
+# For the hosted / self-hosted HTTP server (multi-tenant streamable-http).
+hosted = [
+    "uvicorn>=0.30",
 ]
 
 [project.urls]

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.3.9 — 2026-07-09
+
+Hosted-server support.
+
+- **`GET /healthz` (and `/health`)** on the multi-tenant HTTP server returns an
+  unauthenticated `200 {"status":"ok"}` for load-balancer health probes. Scoped
+  so it can never expose an MCP endpoint without a bearer.
+- **`Dockerfile`** for the hosted / self-hosted multi-tenant server, plus a
+  `hosted` extra (`pip install "hebbrix-mcp[hosted]"`, adds uvicorn). Runs the
+  one-instance-many-users streamable-http server; the image behind
+  `mcp.hebbrix.com`.
+
 ## 0.3.8 — 2026-07-09
 
 New features.

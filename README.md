@@ -191,6 +191,12 @@ HEBBRIX_API_KEY=mem_sk_... uvx hebbrix-mcp --transport streamable-http
 HEBBRIX_MCP_MULTI_TENANT=1 HEBBRIX_MCP_HOST=0.0.0.0 uvx hebbrix-mcp --transport streamable-http
 ```
 
+Or run the container (multi-tenant by default, `GET /healthz` for load-balancer probes):
+
+```bash
+docker build -t hebbrix-mcp . && docker run -p 8080:8080 hebbrix-mcp
+```
+
 ```json
 { "mcpServers": { "hebbrix": {
   "url": "https://your-host/mcp",
@@ -235,7 +241,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 37 offline tests, no network needed
+pytest tests/ -q            # 40 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 
