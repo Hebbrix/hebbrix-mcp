@@ -152,7 +152,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
 **Reasoning & account**
 
 - `hebbrix_confidence` - How confident should the agent be before acting? Grounded in memory + past outcomes.
-- `hebbrix_log_decision` - Record a decision and its outcome; feeds future confidence.
+- `hebbrix_log_decision` - Record a decision and its outcome; feeds future confidence. Right after a `hebbrix_confidence` check you can log just the `outcome` — the description auto-fills from what you asked.
 - `hebbrix_list_collections` - List the memory spaces this key can use.
 - `hebbrix_account_status` - Tier, usage, limits, and expiry.
 

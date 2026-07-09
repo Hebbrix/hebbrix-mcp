@@ -7,17 +7,22 @@ Thanks for helping make agent memory better. This is a small, focused codebase �
 ```bash
 git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
-./quick_setup.sh          # creates ./venv and installs editable
+./quick_setup.sh              # creates ./venv and installs editable
 source venv/bin/activate
-pip install pytest        # test runner
+pip install -e ".[dev]"       # pytest + ruff (CI runs both)
 ```
 
 ## Layout
 
 ```
-hebbrix_mcp/server.py   — the entire server: tools, transports, agent mode, claim CLI
-hebbrix_mcp/__init__.py — public exports + version
-tests/test_server.py    — offline tests (httpx is faked; no network, no key)
+hebbrix_mcp/server.py     — the entire server: tools, transports, agent mode,
+                            claim + profile CLI, multi-tenant middleware
+hebbrix_mcp/__init__.py   — public exports + version
+tests/test_server.py      — offline tests (httpx is faked; no network, no key)
+.claude-plugin/           — Claude Code plugin manifest + single-plugin marketplace
+hooks/hooks.json          — plugin SessionStart hook wiring
+scripts/session-init.sh   — hook script: injects the compiled profile into a session
+Dockerfile                — hosted / self-hosted multi-tenant image
 ```
 
 ## Running
@@ -39,7 +44,8 @@ pytest tests/ -q                             # must stay green
   model reads when deciding to call it — write for the model, not for pydoc.
 - **Zero state here.** This package must never persist user data beyond the
   credentials file. All state lives in the Hebbrix backend.
-- **No new dependencies** without discussion — it's `mcp` + `httpx` on purpose.
+- **No new runtime dependencies** without discussion — the core is `mcp` +
+  `httpx` on purpose (the optional `hosted` extra adds only `uvicorn`).
 
 ## Pull requests
 

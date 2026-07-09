@@ -12,11 +12,17 @@ Transports (choose at launch, see run()):
 
 Configured via env vars (all optional — with none set, the server starts in
 agent mode and mints a free account automatically):
-  HEBBRIX_API_KEY        Bearer token (agent mode mints one if unset)
-  HEBBRIX_API_BASE       default https://api.hebbrix.com/v1
-  HEBBRIX_COLLECTION_ID  default collection for writes/reads
-  HEBBRIX_CONFIG         where agent-mode credentials are saved
-  HEBBRIX_MCP_HOST/PORT  bind address (streamable-http only)
+  HEBBRIX_API_KEY          Bearer token (agent mode mints one if unset)
+  HEBBRIX_API_BASE         default https://api.hebbrix.com/v1
+  HEBBRIX_COLLECTION_ID    default collection for writes/reads
+  HEBBRIX_CONFIG           where agent-mode credentials are saved
+  HEBBRIX_MCP_HOST/PORT    bind address (streamable-http only)
+  HEBBRIX_MCP_MULTI_TENANT hosted mode: authenticate each request from its own
+                           Authorization header (one instance serves many users)
+
+CLI subcommands: `hebbrix-mcp claim --email <you>` (upgrade an agent account),
+`hebbrix-mcp profile` (print the compiled profile — used by the Claude Code
+plugin's SessionStart hook).
 """
 from __future__ import annotations
 
