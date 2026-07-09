@@ -247,3 +247,38 @@ def test_pow_solver_produces_valid_nonce():
     assert nonce is not None
     digest = hashlib.sha256(f"chal-xyz:{nonce}".encode()).digest()
     assert int.from_bytes(digest, "big") < (1 << (256 - bits))
+
+
+# ------------------------- remember routing + read-after-write (v0.3.5) ------
+def test_remember_default_is_raw_with_wait_for_index(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(201, {"id": "m1"}))
+    out = asyncio.run(S.hebbrix_remember("a clean fact", collection_id="c1"))
+    _, url, kw = client.calls[-1]
+    assert url.endswith("/memories/raw")
+    assert kw["json"]["wait_for_index"] is True   # searchable on return
+    assert "infer" not in kw["json"]              # no more ignored infer flag
+    assert out["searchable"] is True
+
+
+def test_remember_extract_routes_to_smart_endpoint(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"id": "p1", "created_count": 2,
+                                                   "updated_count": 0}))
+    out = asyncio.run(S.hebbrix_remember("messy multi-fact text", collection_id="c1",
+                                         extract=True))
+    _, url, kw = client.calls[-1]
+    assert url.endswith("/memories") and not url.endswith("/memories/raw")
+    assert kw["json"]["infer"] is True
+    assert out["extracted"] == 2
+
+
+def test_remember_wait_for_index_false_passthrough(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(201, {"id": "m1"}))
+    asyncio.run(S.hebbrix_remember("fact", collection_id="c1", wait_for_index=False))
+    assert client.calls[-1][2]["json"]["wait_for_index"] is False
+
+
+def test_instructions_tell_model_to_prefer_hebbrix_over_files():
+    ins = S.INSTRUCTIONS.lower()
+    assert "use hebbrix as your memory" in ins
+    assert "do not write it to a local file" in ins or "do not" in ins
+    assert "claude.md" in ins  # explicitly names the host-native memory surface

@@ -141,6 +141,22 @@ A server-level instruction block teaches the model when to reach for each tool, 
 
 The server also exposes a `hebbrix://profile` resource and a `context` prompt that inject the user's compiled profile.
 
+## Make Hebbrix the agent's memory
+
+The server ships an instruction block telling the model to use Hebbrix for anything it would "remember." But some hosts (notably Claude Code) have their **own** file-based memory whose instructions live at the system-prompt level and can outrank an MCP server's instructions — so the agent may quietly write notes to a local file instead of Hebbrix.
+
+The reliable fix is one line in your project's `CLAUDE.md` (or your assistant's system prompt / rules file):
+
+```markdown
+## Memory
+Use the Hebbrix MCP server as the single source of truth for long-term memory.
+When you would remember, note, or save anything durable, call `hebbrix_remember`
+(and `hebbrix_search` to recall). Do not write memory to local files or the
+host's built-in memory.
+```
+
+Cursor users: add the same to `.cursorrules`. This puts the preference at the level the host respects, so Hebbrix wins consistently.
+
 ## Running modes
 
 **Local (default) — stdio.** What the quick start does: one process per client.

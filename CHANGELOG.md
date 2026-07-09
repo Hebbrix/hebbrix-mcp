@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.5 — 2026-07-09
+
+Fixes from external integrator feedback.
+
+- **Read-after-write**: `hebbrix_remember` now defaults `wait_for_index=True`, so
+  a stored memory is searchable the moment the call returns (previously raw
+  writes indexed asynchronously and could be missing from search for many
+  seconds). Pass `wait_for_index=False` for fire-and-forget bulk writes.
+- **Honest `remember` semantics**: the old `verbatim` flag was a no-op —
+  `/memories/raw` ignores fact-extraction, so both values stored raw. Replaced
+  with `extract` (default False = exact/raw storage, one memory). `extract=True`
+  routes to the fact-extraction endpoint and returns the atomic memories it
+  created.
+- **Use Hebbrix as the agent's memory**: the server instruction block now tells
+  the model to prefer Hebbrix over writing notes to local files / the host's
+  built-in memory, and the README documents a `CLAUDE.md` / `.cursorrules`
+  snippet as the reliable lever where host memory outranks MCP instructions.
+
+
 ## 0.3.4 — 2026-07-08
 
 - **Proof-of-work signup for shared-IP / CGNAT.** On the accountless path the
