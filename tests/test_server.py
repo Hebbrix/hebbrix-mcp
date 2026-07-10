@@ -621,3 +621,19 @@ def test_handshake_reports_hebbrix_version_not_sdk():
     sdk = version("mcp")
     assert S.mcp._mcp_server.version == S._SERVER_VERSION
     assert S.mcp._mcp_server.version != sdk
+
+
+# --------------------------- graph enrichment state (v0.3.11) ---------------
+def test_remember_flags_async_graph_enrichment(monkeypatch):
+    _fake(monkeypatch, FakeResponse(201, {"id": "m1"}))
+    out = asyncio.run(S.hebbrix_remember("Atlas is our deploy tool", collection_id="c1"))
+    # wait_for_index covers memory search; the graph is enriched separately.
+    assert out["graph_enrichment"] == "processing"
+    assert out["searchable"] is True
+
+
+def test_remember_extract_flags_async_graph_enrichment(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"id": "m1", "memory": "Atlas is a deploy tool", "event": "ADD"}]}))
+    out = asyncio.run(S.hebbrix_remember("Atlas deploy tool", collection_id="c1", extract=True))
+    assert out["graph_enrichment"] == "processing"

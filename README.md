@@ -133,7 +133,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
     - `content` (string, required): the memory text
     - `tags` (list, optional), `collection_id` (string, optional)
     - `extract` (bool, default false): false stores the text exactly (one memory); true runs fact-extraction and may create several atomic memories
-    - `wait_for_index` (bool, default true): searchable the moment the call returns
+    - `wait_for_index` (bool, default true): guarantees **memory-search** availability — `hebbrix_search` returns the fact the moment the call returns. It does **not** cover knowledge-graph enrichment (entities/timelines/graph), which lands asynchronously (~30s); the response's `graph_enrichment: "processing"` flags this.
 - `hebbrix_search` - Semantic search (hybrid vector + BM25 + graph retrieval).
     - `query` (string, required), `limit` (int, optional), `collection_id` (string, optional)
 - `hebbrix_get` - Fetch one memory by id, with metadata.
@@ -234,7 +234,8 @@ Common issues:
 - **`HTTP 401` on every call** — the key is wrong or revoked. Unset `HEBBRIX_API_KEY`, delete `~/.hebbrix/config.json`, and restart to re-provision, or paste a fresh key from the dashboard.
 - **Agent mode won't start (`auto-signup unavailable`)** — signup may be at daily capacity or your network blocks the API. Set `HEBBRIX_API_KEY` instead.
 - **`claim` says `EMAIL_IN_USE`** — claiming needs an email with no existing Hebbrix account. Use a fresh address (a `you+agent@gmail.com` alias works).
-- **A memory isn't searchable immediately** — indexing is asynchronous; typical convergence is under 30 seconds.
+- **A memory isn't searchable immediately** — pass `wait_for_index=true` (the default) for read-after-write on `hebbrix_search`. Otherwise indexing is asynchronous; typical convergence is under 30 seconds.
+- **A just-written fact's entities aren't in the graph yet** — knowledge-graph enrichment (entities, timelines, graph queries) runs *asynchronously after* the write and is not covered by `wait_for_index`. It typically lands within ~30s; the write response's `graph_enrichment: "processing"` signals it's still in flight.
 
 ## Development
 
@@ -243,7 +244,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 55 offline tests, no network needed
+pytest tests/ -q            # 57 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 

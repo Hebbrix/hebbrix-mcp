@@ -472,14 +472,21 @@ async def hebbrix_remember(
     extract=False (default): stores the text exactly as given (fast, one memory).
     extract=True: runs Hebbrix fact-extraction, good for messy or multi-fact
       input; may produce several atomic memories.
-    wait_for_index=True (default): the memory is searchable the moment this
-      returns (read-after-write). Set False for fire-and-forget bulk writes.
+    wait_for_index=True (default): guarantees MEMORY SEARCH availability — the
+      memory is returned by hebbrix_search the moment this call returns
+      (read-after-write). Set False for fire-and-forget bulk writes.
+
+    Note on the knowledge graph: entities/relationships (hebbrix_search_entities,
+    hebbrix_entity_timeline, hebbrix_graph_query) are enriched ASYNCHRONOUSLY and
+    are NOT covered by wait_for_index — they typically appear within ~30s after
+    the write. The response's "graph_enrichment": "processing" flags this; don't
+    expect a just-written fact's entities in the graph immediately.
 
     Saving several facts at once? Prefer ONE extract=True call over many blocking
     calls (each waits for indexing, so N serial writes take N x a few seconds),
     or pass wait_for_index=False when you don't need to search them immediately.
 
-    Returns {"id", "status", ...} or {"error"}.
+    Returns {"id", "status", "searchable", "graph_enrichment", ...} or {"error"}.
     """
     cid = _cid(collection_id)
     if not cid:
@@ -508,7 +515,10 @@ async def hebbrix_remember(
                                  "event": it.get("event")}
                                 for it in results[:10]],
                    "status": data.get("processing_status", "pending"),
-                   "searchable": wait_for_index})
+                   "searchable": wait_for_index,
+                   # Memory search is ready (per searchable); entity/graph
+                   # enrichment runs asynchronously and lands separately.
+                   "graph_enrichment": "processing"})
     # Default: exact/raw storage. wait_for_index makes it searchable on return.
     body = {"content": content, "collection_id": cid, "wait_for_index": wait_for_index}
     if tags:
@@ -518,7 +528,11 @@ async def hebbrix_remember(
         return data
     _cache_put(data.get("id"), content, cid)
     return _u({"id": data.get("id"), "status": data.get("processing_status", "pending"),
-               "importance": data.get("importance"), "searchable": wait_for_index})
+               "importance": data.get("importance"), "searchable": wait_for_index,
+               # Memory search is ready (per searchable); entity/graph enrichment
+               # runs asynchronously (typically ready within ~30s), separate from
+               # wait_for_index.
+               "graph_enrichment": "processing"})
 
 
 @mcp.tool()
@@ -679,6 +693,10 @@ async def hebbrix_search_entities(
 ) -> dict[str, Any]:
     """List entities in the knowledge graph (people, organizations, tools, places),
     optionally filtered by entity_type. Use for "who/what do I know about" questions.
+
+    Note: entities are enriched ASYNCHRONOUSLY after a write (not covered by
+    hebbrix_remember's wait_for_index) — a just-written fact's entities typically
+    appear here within ~30s, so an empty result right after a write is expected.
     """
     data = await _get("/knowledge-graph/entities",
                       {"entity_type": entity_type, "limit": limit, "collection_id": _cid(collection_id)})

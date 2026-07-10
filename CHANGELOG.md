@@ -1,5 +1,24 @@
 # Changelog
 
+## 0.3.11 — 2026-07-09
+
+Transparency for asynchronous graph enrichment (external eval).
+
+- **`wait_for_index` semantics clarified.** It guarantees MEMORY-SEARCH
+  availability (`hebbrix_search` returns the fact on return) — it does NOT cover
+  knowledge-graph enrichment (entities/timelines/graph queries), which lands
+  asynchronously (~30s after the write). The `hebbrix_remember` docstring,
+  `hebbrix_search_entities` docstring, and README now say so, so
+  `search_entities` returning empty right after a write reads as expected, not
+  broken.
+- **New `graph_enrichment: "processing"` field** on the `hebbrix_remember`
+  response (raw + extract), surfacing that entity/graph indexing is in flight
+  separately from memory search.
+
+(Companion backend fixes shipped the same day: confidence calibration — a single
+direct high-score match now scores meaningfully above 0.5 instead of "weak" — and
+an entity-type backstop that stops a product/tool being typed as a person.)
+
 ## 0.3.10 — 2026-07-09
 
 Mutation-consistency fixes from an external correctness report. The 0.3.8
