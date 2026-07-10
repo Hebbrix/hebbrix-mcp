@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.12 — 2026-07-10
+
+Write-behind overlay precision fixes (external adversarial eval).
+
+- **No more stopword injection (N1).** `hebbrix_search`'s read-after-write
+  overlay matched ANY shared query token — including function words like "the"
+  — and injected the write at a fake `score: 1.0`, so an unrelated cached memory
+  could rank #1 on a shared "the"/"is". Now it ignores stopwords, requires a
+  shared CONTENT word (whole-word, not substring), and scores the injected row
+  by overlap in [0.5, 0.9] and re-ranks — a fresh local write surfaces but can
+  never outrank a genuine remote hit.
+- **`corrected` is honest (N2).** `hebbrix_search` flagged `corrected: true` on
+  every session-cached id, including freshly-created memories that were never
+  updated. It's now set only when the cached content actually differs from the
+  remote row.
+- **SessionStart hook cold-start note.** When the profile is empty the plugin
+  hook now notes it may be a brand-new account still compiling (~1 min), so the
+  agent doesn't read "(none yet)" as "no memory".
+
+62 offline tests. (Companion backend fix same day: `/knowledge-graph/query` is
+now metered as a retrieval, not a write — report 5b.)
+
 ## 0.3.11 — 2026-07-09
 
 Transparency for asynchronous graph enrichment (external eval).

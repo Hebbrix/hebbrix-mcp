@@ -637,3 +637,52 @@ def test_remember_extract_flags_async_graph_enrichment(monkeypatch):
         {"id": "m1", "memory": "Atlas is a deploy tool", "event": "ADD"}]}))
     out = asyncio.run(S.hebbrix_remember("Atlas deploy tool", collection_id="c1", extract=True))
     assert out["graph_enrichment"] == "processing"
+
+
+# ================= write-behind overlay precision (v0.3.12) =================
+# N1: an unrelated cached write must not be injected via a shared stopword, and
+# never at a fake score 1.0.
+def test_overlay_does_not_inject_on_stopword_only_overlap(monkeypatch):
+    S._cache_put("w1", "The user's favorite color is teal.", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": []}))
+    out = asyncio.run(S.hebbrix_search(
+        "what is the deployment schedule for the api", collection_id="c1"))
+    assert all(r["id"] != "w1" for r in out["results"])   # "the" is not a match
+
+
+def test_overlay_injects_on_content_word_below_score_one(monkeypatch):
+    S._cache_put("w1", "the deployment schedule is Friday at noon", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": []}))
+    out = asyncio.run(S.hebbrix_search("deployment schedule", collection_id="c1"))
+    w1 = next(r for r in out["results"] if r["id"] == "w1")
+    assert w1["just_written"] is True
+    assert w1["score"] < 1.0        # never a fake perfect match
+    assert w1["score"] >= 0.5
+
+
+def test_overlay_never_outranks_a_stronger_remote_hit(monkeypatch):
+    # A partial-overlap local write must not beat a strong genuine remote match.
+    S._cache_put("w1", "deployment notes for later", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "r1", "content": "the deployment schedule is Friday", "score": 0.95}]}))
+    out = asyncio.run(S.hebbrix_search("deployment schedule", collection_id="c1"))
+    assert out["results"][0]["id"] == "r1"   # strong remote hit stays #1
+
+
+# N2: corrected must be set ONLY when the cached content actually differs.
+def test_freshly_created_memory_is_not_flagged_corrected(monkeypatch):
+    S._cache_put("m1", "Widget pricing is confidential.", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "m1", "content": "Widget pricing is confidential.", "score": 0.99}]}))
+    out = asyncio.run(S.hebbrix_search("widget pricing", collection_id="c1"))
+    m1 = next(r for r in out["results"] if r["id"] == "m1")
+    assert "corrected" not in m1        # never updated -> not corrected
+
+
+def test_actually_corrected_memory_is_flagged(monkeypatch):
+    S._cache_put("m1", "Widget pricing is public.", "c1")   # in-session correction
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "m1", "content": "Widget pricing is confidential.", "score": 0.99}]}))
+    out = asyncio.run(S.hebbrix_search("widget pricing", collection_id="c1"))
+    m1 = next(r for r in out["results"] if r["id"] == "m1")
+    assert m1.get("corrected") is True and m1["content"] == "Widget pricing is public."

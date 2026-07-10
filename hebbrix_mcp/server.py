@@ -144,17 +144,43 @@ def _cached_write(mem_id: str) -> Optional[dict]:
     return None
 
 
+# Function words carry no relevance signal, so a shared "the"/"is"/"of" must not
+# make an unrelated cached write look like a match.
+_OVERLAY_STOPWORDS = {
+    "the", "a", "an", "of", "to", "in", "on", "at", "for", "and", "or", "is",
+    "are", "was", "were", "be", "been", "am", "i", "my", "me", "we", "our",
+    "you", "your", "it", "its", "this", "that", "these", "those", "with", "from",
+    "as", "by", "what", "which", "who", "whom", "how", "when", "where", "why",
+    "do", "does", "did", "can", "could", "would", "should", "will", "shall",
+    "has", "have", "had", "not", "no", "yes", "if", "so", "than", "then", "there",
+    "about", "into", "out", "up", "down", "over", "under", "again", "just",
+}
+
+
+def _sig_tokens(text: Optional[str]) -> set:
+    """Significant word tokens: lowercase, length >= 2, minus function words."""
+    return {
+        t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
+        if len(t) >= 2 and t not in _OVERLAY_STOPWORDS
+    }
+
+
 def _overlay_recent_writes(
     collection_id: Optional[str], existing_ids: set, query: Optional[str] = None
 ) -> list[dict]:
-    """Recent local writes/corrections (in scope, matching query if given) whose
-    id the remote result set did NOT already return — prepended so a just-written
-    or just-corrected memory is recallable even before the remote index catches
-    up. Tombstoned ids are excluded. Newest first. Query match is a lenient
-    token-substring test (the stored text is verbatim, so exact recall matches)."""
+    """Recent local writes/corrections (in scope) whose id the remote result set
+    did NOT already return — so a just-written/-corrected memory is recallable
+    before the remote index catches up. Tombstoned ids excluded. Newest first.
+
+    When a query is given, a write is injected ONLY if it shares a CONTENT word
+    with the query (function words ignored, whole-word match — a shared "the"
+    is not a match), and each result carries an overlap-scaled `_overlay_score`
+    in [0.5, 0.9] so a fresh local write can surface but never outranks a genuine
+    remote hit with a fake 1.0. With no query (list) all in-scope recent writes
+    are returned."""
     if not _LOCAL_CACHE:
         return []
-    q_tokens = [t for t in re.findall(r"[a-z0-9]+", (query or "").lower()) if len(t) >= 2]
+    q_tokens = _sig_tokens(query) if query else set()
     out = []
     for w in reversed(_RECENT_WRITES):
         if w["id"] in existing_ids or _is_tombstoned(w["id"]):
@@ -162,10 +188,13 @@ def _overlay_recent_writes(
         if collection_id and w.get("collection_id") and w["collection_id"] != collection_id:
             continue
         if q_tokens:
-            content_l = (w["content"] or "").lower()
-            if not any(t in content_l for t in q_tokens):
-                continue
-        out.append(w)
+            overlap = q_tokens & _sig_tokens(w["content"])
+            if not overlap:
+                continue  # no shared content word -> not a match
+            score = round(0.5 + 0.4 * (len(overlap) / len(q_tokens)), 3)
+        else:
+            score = 0.6  # list (no query): plain recency surface
+        out.append({**w, "_overlay_score": score})
     return out
 
 
@@ -566,15 +595,22 @@ async def hebbrix_search(
                "score": round(i.get("score") or 0.0, 3)}
         if rid is not None:
             cw = _cached_write(rid)
-            if cw and cw.get("content") is not None:
-                row["content"] = cw["content"]  # cached correction wins over stale remote
+            # Only override + flag "corrected" when the cached content ACTUALLY
+            # differs from the remote row (a real in-session correction). A
+            # freshly-created, never-updated memory matches remote -> no flag.
+            if (cw and cw.get("content") is not None
+                    and cw["content"] != row["content"]):
+                row["content"] = cw["content"]
                 row["corrected"] = True
             seen.add(rid)
         out.append(row)
-    # Prepend just-written/-corrected memories the remote index hasn't surfaced yet.
+    # Surface just-written/-corrected memories the remote index hasn't returned
+    # yet, at an overlap-scaled score (never a fake 1.0), then rank the whole set
+    # by score so a fresh local write interleaves honestly with real remote hits.
     for w in _overlay_recent_writes(cid, seen, query=query):
-        out.insert(0, {"id": w["id"], "content": w["content"],
-                       "score": 1.0, "just_written": True})
+        out.append({"id": w["id"], "content": w["content"],
+                    "score": w.get("_overlay_score", 0.6), "just_written": True})
+    out.sort(key=lambda r: r.get("score") or 0.0, reverse=True)
     out = out[:limit]
     return _u({"query": query, "count": len(out), "results": out,
             "processing_time_ms": data.get("processing_time_ms")})

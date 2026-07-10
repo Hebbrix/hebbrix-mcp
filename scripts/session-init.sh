@@ -23,8 +23,19 @@ fi
 
 [ -z "$profile" ] && profile="(none yet)"
 
+# When the profile is empty it may be a brand-new account whose profile is still
+# compiling (typically ~1 minute after the first memories) rather than a user
+# with nothing saved — tell the agent so it doesn't assume "no memory".
+cold_note=""
+if [ "$profile" = "(none yet)" ]; then
+  cold_note="
+(If this account is new, the profile may still be compiling — it populates within
+about a minute of the first writes. Use hebbrix_search / hebbrix_remember in the
+meantime; the profile will fill in on the next session.)"
+fi
+
 context="The user's Hebbrix memory profile (durable facts remembered across sessions):
-${profile}
+${profile}${cold_note}
 
 This agent has Hebbrix long-term memory via the hebbrix_* tools. Search memory
 (hebbrix_search) before answering anything that depends on prior context, and
