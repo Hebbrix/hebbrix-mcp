@@ -244,7 +244,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 62 offline tests, no network needed
+pytest tests/ -q            # 66 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 

@@ -591,6 +591,13 @@ async def hebbrix_search(
         rid = i.get("memory_id")
         if rid is not None and _is_tombstoned(rid):
             continue
+        # Drop pure-noise padding: the backend can pad results to `limit` with
+        # zero-relevance rows, and an agent shouldn't treat those as recall. A
+        # just-written / corrected memory that happens to land here is re-surfaced
+        # by the overlay below with a real overlap score, so read-after-write is
+        # preserved. Any positive score (even a weak match) is kept.
+        if (i.get("score") or 0.0) <= 0.0:
+            continue
         row = {"id": rid, "content": i.get("content"),
                "score": round(i.get("score") or 0.0, 3)}
         if rid is not None:
@@ -877,24 +884,38 @@ async def hebbrix_account_status() -> dict[str, Any]:
 # Resource + prompt: inject the user's compiled profile into the conversation  #
 # --------------------------------------------------------------------------- #
 def _profile_text(data: Any) -> str:
-    """Format the user's profile facts as readable lines. /profile returns
-    {"profile": {"static": [...], "dynamic": [...]}} and /profile/facts returns
-    {"static": [...], "dynamic": [...]} — both hold facts under static+dynamic,
-    NOT a "facts" key (the old code read the wrong key and always got nothing)."""
+    """Format the user's profile facts, SEPARATING durable IDENTITY (static
+    facts) from RECENT/TEMPORARY context (dynamic facts) so an ephemeral fact
+    (a project deadline, a current task) is never presented as a permanent
+    identity attribute. /profile returns {"profile":{"static":[...],
+    "dynamic":[...]}}, /profile/facts returns {"static":[...],"dynamic":[...]}."""
     if not isinstance(data, dict):
         return "(none yet)"
     p = data.get("profile") if isinstance(data.get("profile"), dict) else data
-    facts = (p.get("static") or []) + (p.get("dynamic") or [])
-    if not facts:
+    static = p.get("static") or []
+    dynamic = p.get("dynamic") or []
+    if not static and not dynamic:
         return "(none yet)"
-    lines = []
-    for f in facts:
-        key = f.get("key") or f.get("attribute") or f.get("category") or "fact"
-        val = f.get("value")
-        cat = f.get("category")
-        suffix = f" ({cat})" if cat and cat != key else ""
-        lines.append(f"- {key}: {val}{suffix}")
-    return "\n".join(lines)
+
+    def _fmt(facts: list) -> list:
+        out = []
+        for f in facts:
+            key = f.get("key") or f.get("attribute") or f.get("category") or "fact"
+            val = f.get("value")
+            cat = f.get("category")
+            suffix = f" ({cat})" if cat and cat != key else ""
+            out.append(f"- {key}: {val}{suffix}")
+        return out
+
+    parts: list = []
+    if static:
+        parts.extend(_fmt(static))
+    if dynamic:
+        if parts:
+            parts.append("")
+        parts.append("Recent / temporary (may be stale — not durable identity):")
+        parts.extend(_fmt(dynamic))
+    return "\n".join(parts) if parts else "(none yet)"
 
 
 @mcp.resource("hebbrix://profile")

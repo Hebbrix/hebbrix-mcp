@@ -686,3 +686,36 @@ def test_actually_corrected_memory_is_flagged(monkeypatch):
     out = asyncio.run(S.hebbrix_search("widget pricing", collection_id="c1"))
     m1 = next(r for r in out["results"] if r["id"] == "m1")
     assert m1.get("corrected") is True and m1["content"] == "Widget pricing is public."
+
+
+# ============ profile durable/recent separation + zero-relevance (v0.3.13) ===
+def test_profile_text_separates_durable_from_recent():
+    data = {"static": [{"key": "home_city", "value": "Berlin", "category": "location"}],
+            "dynamic": [{"key": "project_deadline", "value": "April 15", "category": "current_project"}]}
+    out = S._profile_text(data)
+    durable, _, recent = out.partition("Recent / temporary")
+    assert "home_city: Berlin" in durable          # durable identity up top
+    assert "project_deadline" not in durable        # ephemeral NOT in durable
+    assert "project_deadline: April 15" in recent    # ephemeral under recent
+
+
+def test_profile_text_only_static_has_no_recent_header():
+    data = {"static": [{"key": "diet", "value": "vegan"}], "dynamic": []}
+    out = S._profile_text(data)
+    assert "diet: vegan" in out and "Recent / temporary" not in out
+
+
+def test_search_drops_zero_score_padding(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "hit", "content": "the real match", "score": 0.8},
+        {"memory_id": "pad", "content": "unrelated padding", "score": 0.0}]}))
+    out = asyncio.run(S.hebbrix_search("real match", collection_id="c1"))
+    ids = [r["id"] for r in out["results"]]
+    assert "hit" in ids and "pad" not in ids
+
+
+def test_search_keeps_weak_positive_match(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "weak", "content": "barely relevant", "score": 0.002}]}))
+    out = asyncio.run(S.hebbrix_search("relevant", collection_id="c1"))
+    assert any(r["id"] == "weak" for r in out["results"])   # positive score kept

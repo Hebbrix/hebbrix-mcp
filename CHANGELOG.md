@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.13 — 2026-07-10
+
+Profile quality + search precision (external eval follow-ups).
+
+- **Profile separates durable identity from recent/temporary.** The injected
+  profile (`hebbrix://profile` resource, `context` prompt, SessionStart hook)
+  now renders durable IDENTITY facts (static) as the profile and puts
+  recent/temporary facts (dynamic) under a clearly-labelled "Recent / temporary
+  (may be stale — not durable identity)" section — so an operational fact (a
+  project deadline, a current task) is never presented as a permanent identity
+  attribute. (Companion backend fix classifies operational/time-bound facts as
+  dynamic at extraction.)
+- **Search drops zero-relevance padding.** `hebbrix_search` no longer returns the
+  backend's `score: 0.0` fill rows, so an agent doesn't treat pure noise as
+  recall. Any positive score (even a weak match) is kept, and a just-written /
+  corrected memory that lands there is still re-surfaced by the read-after-write
+  overlay with a real score.
+
+66 offline tests. (Companion backend fixes same day: entity NER person↔location
+context refinement, and operational-fact durability classification.)
+
 ## 0.3.12 — 2026-07-10
 
 Write-behind overlay precision fixes (external adversarial eval).
