@@ -178,33 +178,38 @@ def test_cid_precedence(monkeypatch):
 
 # ----------------------------------------------------------- multi-tenant
 def test_request_key_contextvar_overrides_global(monkeypatch):
+    # Auth is now per-request (_auth_headers), not baked into the shared client.
     token = S._REQUEST_KEY.set("mem_sk_tenant_a")
     try:
-        client = S._client()
-        assert client.headers["authorization"] == "Bearer mem_sk_tenant_a"
+        assert S._auth_headers()["Authorization"] == "Bearer mem_sk_tenant_a"
     finally:
         S._REQUEST_KEY.reset(token)
-    client = S._client()
-    assert client.headers["authorization"] == f"Bearer {S.KEY}"
+    assert S._auth_headers()["Authorization"] == f"Bearer {S.KEY}"
+
+
+def test_client_is_shared_and_pooled():
+    # The connection-pooled client is reused across calls (no TLS handshake per
+    # call) and carries NO baked-in Authorization (that's per-request).
+    assert S._client() is S._client()
+    assert "authorization" not in {k.lower() for k in S._client().headers}
 
 
 # ------------------------------- customer-reported fixes (v0.3.3) -----------
 def test_multi_tenant_client_never_uses_global_key(monkeypatch):
     # In multi-tenant mode with a stray global KEY set, a request with no
-    # per-request bearer must NOT borrow the server key.
+    # per-request bearer must NOT borrow the server key (auth is per-request).
     monkeypatch.setattr(S, "MULTI_TENANT", True)
     monkeypatch.setattr(S, "KEY", "mem_sk_server_should_not_leak")
     token = S._REQUEST_KEY.set("")  # simulate a request with no bearer
     try:
-        c = S._client()
-        assert c.headers["authorization"] == "Bearer "  # empty, not the server key
+        assert S._auth_headers()["Authorization"] == "Bearer "  # empty, not the server key
     finally:
         S._REQUEST_KEY.reset(token)
     # single-tenant still falls back to the configured key
     monkeypatch.setattr(S, "MULTI_TENANT", False)
     tok = S._REQUEST_KEY.set("")
     try:
-        assert S._client().headers["authorization"] == "Bearer mem_sk_server_should_not_leak"
+        assert S._auth_headers()["Authorization"] == "Bearer mem_sk_server_should_not_leak"
     finally:
         S._REQUEST_KEY.reset(tok)
 
@@ -719,3 +724,19 @@ def test_search_keeps_weak_positive_match(monkeypatch):
         {"memory_id": "weak", "content": "barely relevant", "score": 0.002}]}))
     out = asyncio.run(S.hebbrix_search("relevant", collection_id="c1"))
     assert any(r["id"] == "weak" for r in out["results"])   # positive score kept
+
+
+# =========== error paths carry the usage/claim block (v0.3.14) ==============
+def test_error_response_still_carries_usage_block(monkeypatch):
+    # A quota-limit 402 carries X-Hebbrix-* headers; the tool's error return must
+    # still surface the usage block + claim nudge (the moment it matters most).
+    headers = {
+        "X-Hebbrix-Tier": "shadow", "X-Hebbrix-Status": "limited",
+        "X-Hebbrix-Writes-Used": "300", "X-Hebbrix-Writes-Limit": "300",
+        "X-Hebbrix-Claim": "hebbrix-mcp claim --email <you>",
+    }
+    _fake(monkeypatch, FakeResponse(402, text="WRITE_LIMIT_REACHED", headers=headers))
+    out = asyncio.run(S.hebbrix_search("q", collection_id="c1"))
+    assert out["error"].startswith("HTTP 402")
+    assert out["hebbrix_usage"]["status"] == "limited"
+    assert "claim" in out["hebbrix_usage"]["action_for_human"].lower()

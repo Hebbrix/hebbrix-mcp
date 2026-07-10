@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.14 — 2026-07-10
+
+Code-review follow-ups.
+
+- **The usage/claim block now reaches the agent on errors.** Every tool's error
+  path returned the raw error dict without attaching the `hebbrix_usage` block,
+  so at the exact moment it matters most — a write rejected at the quota limit
+  (402) — the agent never saw `action_for_human` / the claim command. All error
+  returns now go through `_u()`; the backend's 402 already carries the usage
+  headers, so the claim nudge is delivered.
+- **Shared, connection-pooled HTTP client.** The server built a fresh
+  `httpx.AsyncClient` per tool call, paying a TLS handshake every time. It now
+  reuses one pooled client; auth moved to a per-request header (`_auth_headers`)
+  so multi-tenant per-request key isolation is fully preserved (with tests).
+
+68 offline tests.
+
 ## 0.3.13 — 2026-07-10
 
 Profile quality + search precision (external eval follow-ups).

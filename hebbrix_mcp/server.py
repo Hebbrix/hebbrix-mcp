@@ -382,18 +382,31 @@ def _auto_provision() -> bool:
 # --------------------------------------------------------------------------- #
 # HTTP helpers                                                                 #
 # --------------------------------------------------------------------------- #
+_SHARED_CLIENT: Optional[httpx.AsyncClient] = None
+
+
 def _client() -> httpx.AsyncClient:
-    # Headers built per call. In multi-tenant mode the key MUST come from the
-    # per-request Authorization header — never the server's global KEY, so a
-    # stray HEBBRIX_API_KEY on a hosted deployment can't leak into an
-    # unauthenticated request. (The middleware already 401s missing bearers;
-    # this is defense in depth.) In single-tenant/stdio mode, fall back to the
-    # global key set from env / saved config / auto-provision.
+    """Process-wide, connection-pooled httpx client, reused across tool calls so
+    each call does NOT pay a fresh TLS handshake. Auth is NOT baked into the
+    client — the request helpers pass the Authorization header PER REQUEST (see
+    _auth_headers), so multi-tenant per-request keys stay isolated even though the
+    TCP/TLS connection pool is shared. Recreated if it was ever closed."""
+    global _SHARED_CLIENT
+    if _SHARED_CLIENT is None or _SHARED_CLIENT.is_closed:
+        _SHARED_CLIENT = httpx.AsyncClient(
+            timeout=30.0, headers={"Content-Type": "application/json"}
+        )
+    return _SHARED_CLIENT
+
+
+def _auth_headers() -> dict[str, str]:
+    """Per-request Authorization header. In multi-tenant mode the key MUST come
+    from the caller's own bearer (via _REQUEST_KEY) — never the server's global
+    KEY, so a stray HEBBRIX_API_KEY on a hosted deployment can't leak into an
+    unauthenticated request. In single-tenant/stdio mode, fall back to the global
+    key (env / saved config / auto-provision)."""
     key = _REQUEST_KEY.get() or ("" if MULTI_TENANT else KEY)
-    return httpx.AsyncClient(
-        timeout=30.0,
-        headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-    )
+    return {"Authorization": f"Bearer {key}"}
 
 
 def _cid(collection_id: Optional[str]) -> Optional[str]:
@@ -447,29 +460,34 @@ def _u(out: dict[str, Any]) -> dict[str, Any]:
 
 
 async def _get(path: str, params: Optional[dict] = None) -> Any:
-    async with _client() as c:
-        r = await c.get(f"{BASE}{path}", params={k: v for k, v in (params or {}).items() if v is not None})
+    r = await _client().get(
+        f"{BASE}{path}",
+        params={k: v for k, v in (params or {}).items() if v is not None},
+        headers=_auth_headers())
     _capture_usage(r)
     return _err(r) if r.status_code >= 400 else r.json()
 
 
 async def _post(path: str, body: dict) -> Any:
-    async with _client() as c:
-        r = await c.post(f"{BASE}{path}", json={k: v for k, v in body.items() if v is not None})
+    r = await _client().post(
+        f"{BASE}{path}",
+        json={k: v for k, v in body.items() if v is not None},
+        headers=_auth_headers())
     _capture_usage(r)
     return _err(r) if r.status_code >= 400 else r.json()
 
 
 async def _patch(path: str, body: dict) -> Any:
-    async with _client() as c:
-        r = await c.patch(f"{BASE}{path}", json={k: v for k, v in body.items() if v is not None})
+    r = await _client().patch(
+        f"{BASE}{path}",
+        json={k: v for k, v in body.items() if v is not None},
+        headers=_auth_headers())
     _capture_usage(r)
     return _err(r) if r.status_code >= 400 else r.json()
 
 
 async def _delete(path: str) -> dict[str, Any]:
-    async with _client() as c:
-        r = await c.delete(f"{BASE}{path}")
+    r = await _client().delete(f"{BASE}{path}", headers=_auth_headers())
     _capture_usage(r)
     return {"status": r.status_code, "ok": r.status_code < 400}
 
@@ -554,7 +572,7 @@ async def hebbrix_remember(
         body["tags"] = tags
     data = await _post("/memories/raw", body)
     if "error" in data:
-        return data
+        return _u(data)
     _cache_put(data.get("id"), content, cid)
     return _u({"id": data.get("id"), "status": data.get("processing_status", "pending"),
                "importance": data.get("importance"), "searchable": wait_for_index,
@@ -580,7 +598,7 @@ async def hebbrix_search(
         return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
     data = await _post("/search", {"query": query, "collection_id": cid, "limit": limit})
     if "error" in data:
-        return data
+        return _u(data)
     # Reconcile remote results against this session's mutations so read-after-write
     # holds for updates and deletes, not just creates:
     #  - a tombstoned (deleted) id is dropped even if the remote index still has it
@@ -692,7 +710,7 @@ async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> 
         return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
     data = await _get("/memories", {"collection_id": cid, "limit": limit})
     if "error" in data:
-        return data
+        return _u(data)
     items = data.get("items") or data.get("memories") or (data if isinstance(data, list) else [])
     # Same reconciliation as search: drop tombstoned ids, replace a stale remote
     # row with the corrected cached content, then prepend not-yet-indexed writes.
@@ -720,7 +738,7 @@ async def hebbrix_history(memory_id: str) -> dict[str, Any]:
     supersessions). Useful to see what a fact used to be."""
     data = await _get(f"/memories/{memory_id}/history")
     if "error" in data:
-        return data
+        return _u(data)
     versions = data.get("history") or data.get("versions") or (data if isinstance(data, list) else [])
     return _u({"memory_id": memory_id, "versions": versions})
 
@@ -744,7 +762,7 @@ async def hebbrix_search_entities(
     data = await _get("/knowledge-graph/entities",
                       {"entity_type": entity_type, "limit": limit, "collection_id": _cid(collection_id)})
     if "error" in data:
-        return data
+        return _u(data)
     ents = data.get("entities") or (data if isinstance(data, list) else [])
     return _u({"count": data.get("count", len(ents)), "entities": [
         {"name": e.get("name"), "type": e.get("type") or e.get("entity_type"),
@@ -807,7 +825,7 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
     """
     data = await _get("/confidence", {"query": query, "collection_id": _cid(collection_id)})
     if "error" in data:
-        return data
+        return _u(data)
     # Remember this check so a decision logged right after can auto-link to it
     # (the confidence -> action -> outcome loop) without the agent re-typing it.
     if _LOCAL_CACHE:
@@ -853,7 +871,7 @@ async def hebbrix_log_decision(
         "description": description, "outcome": outcome, "decision_type": decision_type,
         "collection_id": _cid(collection_id)})
     if "error" in data:
-        return data
+        return _u(data)
     out = {"id": data.get("id") or data.get("decision_id"), "logged": True,
            "description": description}
     if auto_linked:
@@ -866,7 +884,7 @@ async def hebbrix_list_collections() -> dict[str, Any]:
     """List the collections (memory spaces / tenants) available to this API key."""
     data = await _get("/collections", {"limit": 100})
     if "error" in data:
-        return data
+        return _u(data)
     items = data.get("items") or (data if isinstance(data, list) else [])
     return _u({"count": len(items), "collections": [
         {"id": c.get("id"), "name": c.get("name"), "memory_count": c.get("memory_count")} for c in items]})
