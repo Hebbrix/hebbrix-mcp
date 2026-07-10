@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.15 — 2026-07-10
+
+Reasoning layer: constraint conflicts (external end-to-end eval).
+
+- **`hebbrix_confidence` now surfaces constraint conflicts.** When the proposed
+  action VIOLATES a stored numeric rule — e.g. opening a 600-line PR when a memory
+  says "PRs must be < 400 lines" — the result carries a `constraint_conflict`
+  block `{rule, query_value, threshold, direction, unit}` and
+  `recommended_action` is `do_not_act` (not merely "proceed_with_caution"). This
+  is the higher-value reasoning signal: *does this violate a known constraint*,
+  not just *how well does memory support an answer*.
+
+(Companion backend fixes same day: constraint-conflict detection in `/confidence`,
+and more reliable knowledge-graph entity typing — a project/tool/library/acronym
+is no longer mistyped as a person/location/organization.)
+
+70 offline tests.
+
 ## 0.3.14 — 2026-07-10
 
 Code-review follow-ups.

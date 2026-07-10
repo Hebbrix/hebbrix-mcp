@@ -740,3 +740,24 @@ def test_error_response_still_carries_usage_block(monkeypatch):
     assert out["error"].startswith("HTTP 402")
     assert out["hebbrix_usage"]["status"] == "limited"
     assert "claim" in out["hebbrix_usage"]["action_for_human"].lower()
+
+
+# ============ confidence surfaces constraint conflict (v0.3.15) =============
+def test_confidence_surfaces_constraint_conflict(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {
+        "confidence": 0.68, "recommended_action": "do_not_act",
+        "answer_confidence": 0.68, "reasoning": "CONFLICT ...",
+        "constraint_conflict": {"rule": "PRs must be < 400 lines",
+                                "query_value": 600, "threshold": 400,
+                                "direction": "upper", "unit": "line"}}))
+    out = asyncio.run(S.hebbrix_confidence("open a 600-line PR?", collection_id="c1"))
+    assert out["recommended_action"] == "do_not_act"
+    assert out["constraint_conflict"]["threshold"] == 400
+
+
+def test_confidence_omits_constraint_conflict_when_none(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {
+        "confidence": 0.8, "recommended_action": "act_autonomously",
+        "reasoning": "Strong direct match"}))
+    out = asyncio.run(S.hebbrix_confidence("what is the wifi password?", collection_id="c1"))
+    assert "constraint_conflict" not in out

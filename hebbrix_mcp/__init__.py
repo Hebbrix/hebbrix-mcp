@@ -26,5 +26,5 @@ Configure with env vars:
 """
 from .server import mcp, run
 
-__version__ = "0.3.14"
+__version__ = "0.3.15"
 __all__ = ["mcp", "run", "__version__"]

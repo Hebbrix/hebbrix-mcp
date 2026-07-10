@@ -822,6 +822,10 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
     """Ask how confident the agent should be before acting on something, grounded in
     stored memory and past decision outcomes. Call this before a consequential
     autonomous action. Returns a confidence score and a recommended action.
+
+    If the action VIOLATES a stored numeric rule (e.g. opening a 600-line PR when
+    a memory says "PRs must be < 400 lines"), the result includes a
+    `constraint_conflict` block and recommended_action is do_not_act.
     """
     data = await _get("/confidence", {"query": query, "collection_id": _cid(collection_id)})
     if "error" in data:
@@ -832,11 +836,14 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
         _RECENT_CONFIDENCE.append({"query": query,
                                    "recommended_action": data.get("recommended_action"),
                                    "ts": time.time()})
-    return _u({"confidence": data.get("confidence"),
-            "recommended_action": data.get("recommended_action"),
-            "answer_confidence": data.get("answer_confidence"),
-            "decision_count": data.get("decision_count"),
-            "reasoning": data.get("reasoning") or data.get("explanation")})
+    out = {"confidence": data.get("confidence"),
+           "recommended_action": data.get("recommended_action"),
+           "answer_confidence": data.get("answer_confidence"),
+           "decision_count": data.get("decision_count"),
+           "reasoning": data.get("reasoning") or data.get("explanation")}
+    if data.get("constraint_conflict"):
+        out["constraint_conflict"] = data["constraint_conflict"]
+    return _u(out)
 
 
 @mcp.tool()
