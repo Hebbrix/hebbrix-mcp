@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.17 — 2026-07-11
+
+Search cache honesty (E2E re-review item 4).
+
+- The just-written overlay no longer outranks genuinely-relevant indexed hits. A
+  recent write is capped strictly below the weakest real search hit (recency
+  breaks ties, it doesn't dominate); with no real hits it keeps its own score, so
+  read-after-write still holds.
+- A recent write is no longer surfaced on a shared VERB alone. Common
+  action/preference verbs (use, prefer, like, want, decide, adopt, choose, run,
+  deploy, …) are now overlay stopwords, so "which database do I prefer" stops
+  pulling in an unrelated "I prefer Redux" write — the overlay matches on the
+  substantive nouns, not the verb.
+
+Companion backend (same day): typed edges now materialize for first-person facts
+("I decided to adopt Terraform" → a typed edge, not MENTIONS); tech entities are
+typed `tool` (not the generic `object`) so `search_entities(entity_type="tool")`
+filters your stack; and a backfill script re-types legacy entities in old accounts.
+
+84 offline tests.
+
 ## 0.3.16 — 2026-07-10
 
 Full-E2E review round: 4 new tools + graph/search quality.

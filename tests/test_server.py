@@ -546,6 +546,27 @@ def test_search_overlays_just_written_memory(monkeypatch):
     assert top["just_written"] is True
 
 
+def test_overlay_capped_below_real_hits(monkeypatch):
+    # A just-written memory must not outrank a genuinely-relevant indexed hit.
+    S._cache_put("w1", "the sky is blue today", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "remote1", "content": "sky facts", "score": 0.4}]}))
+    out = asyncio.run(S.hebbrix_search("sky", collection_id="c1", limit=5))
+    w1 = next(r for r in out["results"] if r["id"] == "w1")
+    remote = next(r for r in out["results"] if r["id"] == "remote1")
+    assert w1["score"] < remote["score"]          # capped below the real hit
+    assert out["results"][0]["id"] == "remote1"    # real hit ranks first
+
+
+def test_overlay_shared_verb_only_is_not_a_match(monkeypatch):
+    # "which database do I prefer" vs "I prefer Redux" share only the verb
+    # "prefer" (now a stopword) — the Redux write must NOT be injected.
+    S._cache_put("w1", "I prefer Redux for state", "c1")
+    _fake(monkeypatch, FakeResponse(200, {"results": []}))
+    out = asyncio.run(S.hebbrix_search("which database do I prefer", collection_id="c1"))
+    assert out["results"] == []
+
+
 def test_search_overlay_respects_collection_and_query(monkeypatch):
     S._cache_put("w1", "cats are great", "OTHER")   # wrong collection
     S._cache_put("w2", "dogs are loud", "c1")        # right collection, no match

@@ -154,6 +154,15 @@ _OVERLAY_STOPWORDS = {
     "do", "does", "did", "can", "could", "would", "should", "will", "shall",
     "has", "have", "had", "not", "no", "yes", "if", "so", "than", "then", "there",
     "about", "into", "out", "up", "down", "over", "under", "again", "just",
+    # Common action/preference VERBS: a shared verb ("which db do I *prefer*"
+    # vs "I *prefer* Redux") is a weak signal that wrongly surfaces an unrelated
+    # recent write. Overlay should match on the SUBSTANTIVE nouns, not the verb.
+    "use", "uses", "used", "using", "prefer", "prefers", "preferred", "like",
+    "likes", "want", "wants", "need", "needs", "work", "works", "working",
+    "get", "gets", "got", "set", "sets", "make", "makes", "made", "adopt",
+    "adopts", "adopted", "decide", "decides", "decided", "choose", "chooses",
+    "chose", "run", "runs", "ran", "deploy", "deploys", "add", "adds", "added",
+    "new", "also", "now", "still", "some", "any", "all", "more", "most",
 }
 
 
@@ -762,9 +771,17 @@ async def hebbrix_search(
     # Surface just-written/-corrected memories the remote index hasn't returned
     # yet, at an overlap-scaled score (never a fake 1.0), then rank the whole set
     # by score so a fresh local write interleaves honestly with real remote hits.
+    # A just-written memory the remote index hasn't caught up on is surfaced for
+    # read-after-write, but it must NOT outrank a genuinely-relevant indexed hit:
+    # cap each overlay strictly below the weakest real hit (recency breaks ties,
+    # it doesn't dominate). With no real hits, the overlay keeps its own score.
+    real_scores = [r["score"] for r in out]
+    cap = (min(real_scores) - 0.001) if real_scores else None
     for w in _overlay_recent_writes(cid, seen, query=query):
         _os = w.get("_overlay_score", 0.6)
-        if _os < min_score:
+        if cap is not None:
+            _os = round(min(_os, cap), 3)
+        if _os < min_score or _os <= 0.0:
             continue
         out.append({"id": w["id"], "content": w["content"],
                     "score": _os, "just_written": True})
