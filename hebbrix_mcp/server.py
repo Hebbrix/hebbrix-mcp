@@ -415,8 +415,9 @@ def _cid(collection_id: Optional[str]) -> Optional[str]:
 
 def _err(r: httpx.Response) -> dict[str, Any]:
     # Keep enough of the body that the API's actionable guidance (e.g. "use X
-    # instead") isn't chopped mid-sentence.
-    return {"error": f"HTTP {r.status_code}: {r.text[:800]}"}
+    # instead") isn't chopped mid-sentence. `status` lets callers branch on the
+    # HTTP code (e.g. degrade a tier-gated batch write to sequential on 403).
+    return {"error": f"HTTP {r.status_code}: {r.text[:800]}", "status": r.status_code}
 
 
 def _capture_usage(r: httpx.Response) -> None:
@@ -501,6 +502,72 @@ def _mem_row(m: dict) -> dict[str, Any]:
     }
 
 
+def _node_name(v: Any) -> Optional[str]:
+    """A graph endpoint node can arrive as a bare string or a nested object
+    ({"name":...,"type":...,"metadata":"{...}"}). Reduce it to just its name."""
+    if isinstance(v, dict):
+        return v.get("name") or v.get("id") or v.get("entity") or v.get("canonical_name")
+    return v
+
+
+def _node_type(v: Any) -> Optional[str]:
+    if isinstance(v, dict):
+        t = v.get("type") or v.get("entity_type")
+        if not t:
+            md = v.get("metadata")
+            if isinstance(md, str):
+                try:
+                    md = json.loads(md)
+                except Exception:
+                    md = None
+            if isinstance(md, dict):
+                t = md.get("entity_type") or md.get("spacy_label")
+        return t
+    return None
+
+
+def _shape_graph(entity: str, data: dict) -> dict[str, Any]:
+    """Trim the raw /knowledge-graph/query payload the way hebbrix_search trims
+    search hits: flatten nested source/target objects to names + types, drop
+    stringified-JSON metadata blobs and internal ids, and present a clean
+    {entity, relationships:[{from,to,type,valid_from,valid_to}], entities:[...]}.
+    """
+    # /knowledge-graph/query returns {"results":[{source, target,
+    # relationship_type, confidence, valid_from, valid_to, properties}], ...}.
+    rels_in = (data.get("results") or data.get("relationships")
+               or data.get("edges") or data.get("facts") or [])
+    rels: list[dict[str, Any]] = []
+    for r in rels_in:
+        if not isinstance(r, dict):
+            continue
+        src = _node_name(r.get("source") if "source" in r else r.get("from") or r.get("subject"))
+        tgt = _node_name(r.get("target") if "target" in r else r.get("to") or r.get("object"))
+        rtype = (r.get("relationship_type") or r.get("relation_type") or r.get("type")
+                 or r.get("relation") or r.get("predicate"))
+        row = {"from": src, "to": tgt, "type": rtype}
+        vf = r.get("valid_from") or r.get("start") or r.get("from_ts")
+        vt = r.get("valid_to") or r.get("end") or r.get("to_ts")
+        if vf:
+            row["valid_from"] = vf
+        if vt:
+            row["valid_to"] = vt
+        conf = r.get("confidence")
+        if conf is not None:
+            row["confidence"] = round(conf, 3) if isinstance(conf, (int, float)) else conf
+        rels.append(row)
+    ents_in = data.get("entities") or data.get("nodes") or []
+    ents = [{"name": _node_name(e), "type": _node_type(e)}
+            for e in ents_in if _node_name(e)]
+    out: dict[str, Any] = {"entity": entity.strip().lower(),
+                           "count": len(rels), "relationships": rels}
+    if ents:
+        out["entities"] = ents
+    for k in ("timestamp", "depth", "as_of"):
+        if data.get(k) is not None:
+            out[k] = data[k]
+    return out
+
+
 # --------------------------------------------------------------------------- #
 # Memory tools (CRUD + version history)                                        #
 # --------------------------------------------------------------------------- #
@@ -583,19 +650,81 @@ async def hebbrix_remember(
 
 
 @mcp.tool()
+async def hebbrix_remember_many(
+    facts: list[str],
+    collection_id: Optional[str] = None,
+    wait_for_index: bool = False,
+) -> dict[str, Any]:
+    """Store MANY facts in one call. When you've extracted several distinct facts
+    from one user message, use this instead of calling hebbrix_remember N times —
+    it's one round-trip and one rate-limit hit, not N.
+
+    Pass a list of short, self-contained facts (one fact per string). Returns
+    {"created", "failed", "memory_ids", ...}. wait_for_index defaults to False
+    here (bulk writes are usually fire-and-forget); set True to block until all
+    are searchable.
+    """
+    cid = _cid(collection_id)
+    if not cid:
+        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+    facts = [f for f in (facts or []) if isinstance(f, str) and f.strip()]
+    if not facts:
+        return {"error": "pass a non-empty list of fact strings"}
+    if len(facts) > 100:
+        return {"error": "at most 100 facts per call; split into batches"}
+    body = {"memories": [{"content": f, "collection_id": cid} for f in facts],
+            "wait_for_index": wait_for_index}
+    data = await _post("/memories/batch", body)
+    # Batch write is tier-gated (Starter+). On 403/404 fall back to sequential
+    # raw writes so an agent-mode / free account still gets the convenience.
+    if isinstance(data, dict) and "error" in data:
+        status = data.get("status")
+        if status in (403, 404, 405):
+            ids, failed = [], 0
+            for f in facts:
+                r = await _post("/memories/raw",
+                                {"content": f, "collection_id": cid,
+                                 "wait_for_index": wait_for_index})
+                if isinstance(r, dict) and "error" not in r and r.get("id"):
+                    ids.append(r.get("id"))
+                    _cache_put(r.get("id"), f, cid)
+                else:
+                    failed += 1
+            return _u({"created": len(ids), "failed": failed, "memory_ids": ids,
+                       "fallback": "sequential"})
+        return _u(data)
+    mem_ids = data.get("memory_ids") or [
+        r.get("id") or r.get("memory_id") for r in (data.get("results") or [])]
+    for f, mid in zip(facts, mem_ids):
+        if mid:
+            _cache_put(mid, f, cid)
+    return _u({"created": data.get("created", len(mem_ids)),
+               "failed": data.get("failed", 0),
+               "memory_ids": mem_ids,
+               "errors": data.get("errors")})
+
+
+@mcp.tool()
 async def hebbrix_search(
     query: str,
     limit: int = 5,
     collection_id: Optional[str] = None,
+    min_score: float = 0.0,
 ) -> dict[str, Any]:
     """Semantic search over memories. Always call this BEFORE answering questions
     that depend on prior context, decisions, or user preferences.
+
+    Zero-relevance padding rows are always dropped. Raise `min_score` (0.0-1.0) to
+    also filter weak matches — e.g. min_score=0.3 keeps only reasonably relevant
+    results, so you don't pay tokens for noise.
 
     Returns {"query", "count", "results": [{"id","content","score"}]}.
     """
     cid = _cid(collection_id)
     if not cid:
         return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+    limit = max(1, min(int(limit), 100))
+    min_score = max(0.0, min(float(min_score), 1.0))
     data = await _post("/search", {"query": query, "collection_id": cid, "limit": limit})
     if "error" in data:
         return _u(data)
@@ -614,10 +743,11 @@ async def hebbrix_search(
         # just-written / corrected memory that happens to land here is re-surfaced
         # by the overlay below with a real overlap score, so read-after-write is
         # preserved. Any positive score (even a weak match) is kept.
-        if (i.get("score") or 0.0) <= 0.0:
+        _sc = i.get("score") or 0.0
+        if _sc <= 0.0 or _sc < min_score:
             continue
         row = {"id": rid, "content": i.get("content"),
-               "score": round(i.get("score") or 0.0, 3)}
+               "score": round(_sc, 3)}
         if rid is not None:
             cw = _cached_write(rid)
             # Only override + flag "corrected" when the cached content ACTUALLY
@@ -633,8 +763,11 @@ async def hebbrix_search(
     # yet, at an overlap-scaled score (never a fake 1.0), then rank the whole set
     # by score so a fresh local write interleaves honestly with real remote hits.
     for w in _overlay_recent_writes(cid, seen, query=query):
+        _os = w.get("_overlay_score", 0.6)
+        if _os < min_score:
+            continue
         out.append({"id": w["id"], "content": w["content"],
-                    "score": w.get("_overlay_score", 0.6), "just_written": True})
+                    "score": _os, "just_written": True})
     out.sort(key=lambda r: r.get("score") or 0.0, reverse=True)
     out = out[:limit]
     return _u({"query": query, "count": len(out), "results": out,
@@ -677,6 +810,8 @@ async def hebbrix_update(
     """
     if content is None and importance is None:
         return {"error": "pass content and/or importance to update"}
+    if importance is not None:
+        importance = max(0.0, min(float(importance), 1.0))
     data = await _patch(f"/memories/{memory_id}", {
         "content": content, "importance": importance, "wait_for_index": wait_for_index})
     if isinstance(data, dict) and "error" in data:
@@ -708,6 +843,7 @@ async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> 
     cid = _cid(collection_id)
     if not cid:
         return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+    limit = max(1, min(int(limit), 200))
     data = await _get("/memories", {"collection_id": cid, "limit": limit})
     if "error" in data:
         return _u(data)
@@ -759,6 +895,7 @@ async def hebbrix_search_entities(
     hebbrix_remember's wait_for_index) — a just-written fact's entities typically
     appear here within ~30s, so an empty result right after a write is expected.
     """
+    limit = max(1, min(int(limit), 100))  # /knowledge-graph/entities caps at 100
     data = await _get("/knowledge-graph/entities",
                       {"entity_type": entity_type, "limit": limit, "collection_id": _cid(collection_id)})
     if "error" in data:
@@ -794,12 +931,15 @@ async def hebbrix_graph_query(
     relationships and facts. Pass an ISO `timestamp` to ask what was true at
     that point in time (bi-temporal). depth = graph hops (1-5).
 
-    For a free-text question ("who works at Sequoia?"), use hebbrix_search
-    instead — this endpoint traverses from a known entity, not from prose.
+    For a free-text question ("who works at Sequoia?"), use hebbrix_ask (it does
+    search + graph + profile and synthesizes an answer) — this endpoint traverses
+    from a known entity, not from prose.
     """
-    return _u(await _post("/knowledge-graph/query", {
+    depth = max(1, min(int(depth), 5))
+    data = await _post("/knowledge-graph/query", {
         "entity": entity.strip().lower(), "relation_type": relation_type,
-        "depth": depth, "timestamp": timestamp, "collection_id": _cid(collection_id)}))
+        "depth": depth, "timestamp": timestamp, "collection_id": _cid(collection_id)})
+    return _u(_shape_graph(entity, data) if isinstance(data, dict) and "error" not in data else data)
 
 
 @mcp.tool()
@@ -844,6 +984,92 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
     if data.get("constraint_conflict"):
         out["constraint_conflict"] = data["constraint_conflict"]
     return _u(out)
+
+
+@mcp.tool()
+async def hebbrix_ask(
+    question: str,
+    collection_id: Optional[str] = None,
+    include_graph: bool = True,
+) -> dict[str, Any]:
+    """Answer a natural-language question from memory in ONE call. Searches
+    memories, synthesizes an answer with an LLM, and CITES the memory ids it used
+    — so you don't have to orchestrate hebbrix_search + hebbrix_graph_query +
+    profile yourself. Use for questions like "who works with me on Atlas and what
+    did we decide?".
+
+    Returns {"question", "answer", "citations":[{"id","content","score"}],
+    "graph"?, "profile"?}. `graph` (when include_graph) adds typed relationships
+    for entities named in the question; `profile` adds durable user facts. If the
+    reasoning backend is unavailable it falls back to raw search hits.
+    """
+    cid = _cid(collection_id)
+    if not cid:
+        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+    out: dict[str, Any] = {"question": question}
+    # 1) Synthesized answer + citations via the secure reasoning endpoint (it does
+    #    scoped hybrid retrieval + LLM + citations). Fall back to plain search so
+    #    the tool never hard-fails on quota/rate-limit.
+    r = await _post("/search/reason", {"query": question, "collection_id": cid})
+    if isinstance(r, dict) and "error" not in r and r.get("answer"):
+        out["answer"] = r.get("answer")
+        out["citations"] = [
+            {"id": s.get("memory_id") or s.get("id"),
+             "content": (s.get("content") or "")[:240],
+             "score": round(s["score"], 3) if isinstance(s.get("score"), (int, float)) else s.get("score")}
+            for s in (r.get("sources") or [])]
+    else:
+        hits = await hebbrix_search(question, limit=5, collection_id=cid)
+        out["answer"] = None
+        out["citations"] = [{"id": h.get("id"), "content": h.get("content"),
+                             "score": h.get("score")}
+                            for h in (hits.get("results") or [])]
+        out["note"] = "reasoning unavailable; returning search hits"
+        if isinstance(r, dict) and r.get("error"):
+            out["reasoning_error"] = r["error"]
+    # 2) Graph enrichment: traverse from entities named in the question.
+    if include_graph:
+        try:
+            ents = await hebbrix_search_entities(limit=50, collection_id=cid)
+            ql = question.lower()
+            named = [e for e in (ents.get("entities") or [])
+                     if e.get("name") and str(e["name"]).lower() in ql][:2]
+            graph: list[dict[str, Any]] = []
+            for e in named:
+                g = await hebbrix_graph_query(str(e["name"]), depth=1, collection_id=cid)
+                for rel in (g.get("relationships") or [])[:8]:
+                    graph.append(rel)
+            if graph:
+                out["graph"] = graph
+        except Exception:
+            pass  # enrichment is best-effort, never fail the answer
+    # 3) Durable profile facts (the "about me" context).
+    prof = await _get("/profile/facts")
+    if isinstance(prof, dict) and "error" not in prof:
+        txt = _profile_text(prof)
+        if txt and txt != "(none yet)":
+            out["profile"] = txt
+    return _u(out)
+
+
+@mcp.tool()
+async def hebbrix_mark_used(
+    memory_id: str,
+    helpful: bool = True,
+    query: Optional[str] = None,
+) -> dict[str, Any]:
+    """Reinforce a memory you actually USED to answer (Hebbian recall): call this
+    when a retrieved memory was helpful (helpful=True, strengthens it) or was noise
+    (helpful=False, weakens it). Over time this makes the memories you rely on rank
+    higher and unused ones fade. `query` is the question it helped answer, if handy.
+    """
+    body = {"memory_id": memory_id, "is_relevant": bool(helpful),
+            "query": query or ""}
+    data = await _post("/feedback/relevance", body)
+    if isinstance(data, dict) and "error" in data:
+        return _u(data)
+    return _u({"memory_id": memory_id, "reinforced": bool(helpful),
+               "weakened": not helpful, "recorded": True})
 
 
 @mcp.tool()
@@ -903,6 +1129,95 @@ async def hebbrix_account_status() -> dict[str, Any]:
     (auto-provisioned account), relay the claim command to the human when usage
     status is 'warning' or worse — claiming is one command and keeps all memories."""
     return _u(await _get("/agent-signup/whoami"))
+
+
+# --------------------------------------------------------------------------- #
+# Data portability                                                             #
+# --------------------------------------------------------------------------- #
+def _export_markdown(payload: dict) -> str:
+    lines = [f"# Hebbrix export — collection {payload.get('collection_id')}",
+             f"_Exported {payload.get('memory_count', 0)} memories, "
+             f"{len(payload.get('entities') or [])} entities._", ""]
+    prof = payload.get("profile")
+    if prof:
+        lines += ["## Profile", _profile_text(prof), ""]
+    lines.append("## Memories")
+    for m in payload.get("memories") or []:
+        created = f" _(created {m['created_at']})_" if m.get("created_at") else ""
+        lines.append(f"- **{m.get('id')}**: {m.get('content')}{created}")
+    ents = payload.get("entities") or []
+    if ents:
+        lines += ["", "## Knowledge-graph entities"]
+        for e in ents:
+            lines.append(f"- {e.get('name')} ({e.get('type') or 'unknown'})")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def hebbrix_export(
+    format: str = "json",
+    collection_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Export EVERYTHING in a collection in one call — all memories, the
+    knowledge-graph entities, and the compiled profile. Data portability: use it
+    to back up or migrate a memory space, nothing is locked in.
+
+    format="json" (default) returns structured data; format="markdown" returns a
+    single human-readable document under the "document" key.
+    """
+    cid = _cid(collection_id)
+    if not cid:
+        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+    # Pull memories in pages so a large space exports fully (not just the first N).
+    memories: list[dict[str, Any]] = []
+    seen_ids: set = set()
+    PAGE, HARD_CAP = 200, 5000
+    cursor: Optional[str] = None
+    truncated = False
+    while True:
+        params: dict[str, Any] = {"collection_id": cid, "limit": PAGE}
+        if cursor:
+            params["cursor"] = cursor
+        data = await _get("/memories", params)
+        if isinstance(data, dict) and "error" in data:
+            return _u(data)
+        items = (data.get("items") or data.get("memories")
+                 or (data if isinstance(data, list) else []))
+        new = 0
+        for m in items:
+            mid = m.get("id") or m.get("memory_id")
+            if mid in seen_ids:
+                continue
+            seen_ids.add(mid)
+            memories.append(_mem_row(m))
+            new += 1
+        cursor = (data.get("next_cursor") or data.get("cursor")) if isinstance(data, dict) else None
+        if new == 0 or not cursor or len(memories) >= HARD_CAP:
+            truncated = len(memories) >= HARD_CAP and bool(cursor)
+            break
+    ent_data = await _get("/knowledge-graph/entities", {"limit": 100, "collection_id": cid})
+    ents = []
+    if isinstance(ent_data, dict) and "error" not in ent_data:
+        for e in (ent_data.get("entities") or []):
+            ents.append({"name": e.get("name"),
+                         "type": e.get("type") or e.get("entity_type"),
+                         "mentions": e.get("mention_count") or e.get("mentions")})
+    prof = await _get("/profile/facts")
+    prof = prof if isinstance(prof, dict) and "error" not in prof else None
+    payload: dict[str, Any] = {
+        "collection_id": cid,
+        "memory_count": len(memories),
+        "memories": memories,
+        "entities": ents,
+        "profile": prof,
+    }
+    if truncated:
+        payload["truncated"] = True
+        payload["note"] = f"export capped at {HARD_CAP} memories"
+    if str(format).lower() in ("markdown", "md"):
+        return _u({"format": "markdown", "collection_id": cid,
+                   "document": _export_markdown(payload)})
+    return _u(payload)
 
 
 # --------------------------------------------------------------------------- #

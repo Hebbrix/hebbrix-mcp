@@ -1,5 +1,41 @@
 # Changelog
 
+## 0.3.16 — 2026-07-10
+
+Full-E2E review round: 4 new tools + graph/search quality.
+
+**New tools**
+- **`hebbrix_ask`** — one-call GraphRAG. Ask a natural-language question; it runs
+  scoped hybrid retrieval + LLM synthesis (via the secure `/search/reason` path),
+  CITES the memory ids it used, and enriches the answer with knowledge-graph
+  relationships for entities named in the question plus your profile. Replaces the
+  3–4-tool dance an agent needed for "who works with me on Atlas and what did we
+  decide?". Falls back to raw search hits if reasoning is unavailable.
+- **`hebbrix_remember_many`** — batch write. Pass `facts=[...]`; one round-trip and
+  one rate-limit hit instead of N. Uses `/memories/batch`, degrades to sequential
+  writes on free/agent tiers.
+- **`hebbrix_mark_used`** — reinforcement on recall (it's in the name): mark a
+  retrieved memory helpful (strengthen) or noise (weaken) so recall improves.
+- **`hebbrix_export`** — dump a whole collection (memories + graph entities +
+  profile) as JSON or Markdown in one call. Data portability, nothing locked in.
+
+**Quality**
+- `hebbrix_search` gains `min_score` (0.0–1.0). Zero-relevance padding is always
+  dropped; raise `min_score` to filter weak matches so you don't pay tokens for
+  noise.
+- `hebbrix_graph_query` now returns a trimmed `{entity, relationships:[{from,to,
+  type,valid_from,confidence}]}` shape instead of raw backend payloads (nested
+  source/target node objects, stringified-JSON metadata, internal ids).
+- Input validation: `depth` (graph_query) clamped 1–5, `limit`s clamped, `update`
+  `importance` clamped 0–1.
+
+Companion backend (same day): typed KG edges — `use`/`prefer`/`decide`/`adopt`/…
+now produce `uses`/`prefers`/`decided_on` edges instead of generic `mentions`, and
+curated tech terms (redux, postgres, heroku, …) are extracted as graph nodes so
+those typed edges can form and type correctly (heroku is a tool, not a place).
+
+82 offline tests.
+
 ## 0.3.15 — 2026-07-10
 
 Reasoning layer: constraint conflicts (external end-to-end eval).

@@ -78,7 +78,7 @@ def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 15
+        assert len(tools) == 19
         names = {t.name for t in tools}
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
                          "hebbrix_update", "hebbrix_forget", "hebbrix_list",
@@ -86,7 +86,8 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_entity_timeline", "hebbrix_graph_query",
                          "hebbrix_contradictions", "hebbrix_confidence",
                          "hebbrix_log_decision", "hebbrix_list_collections",
-                         "hebbrix_account_status"):
+                         "hebbrix_account_status", "hebbrix_export",
+                         "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used"):
             assert expected in names
         resources = await S.mcp.list_resources()
         assert [str(r.uri) for r in resources] == ["hebbrix://profile"]
@@ -117,6 +118,177 @@ def test_search_reshapes_results(monkeypatch):
     out = asyncio.run(S.hebbrix_search("q", collection_id="c1"))
     assert out["count"] == 1
     assert out["results"][0] == {"id": "m1", "content": "hello", "score": 0.91}
+
+
+def test_search_min_score_filters_weak_matches(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "m1", "content": "strong", "score": 0.8},
+        {"memory_id": "m2", "content": "weak", "score": 0.2},
+        {"memory_id": "m3", "content": "pad", "score": 0.0}]}))
+    out = asyncio.run(S.hebbrix_search("q", collection_id="c1", min_score=0.3))
+    assert [r["id"] for r in out["results"]] == ["m1"]  # weak + zero dropped
+
+
+def test_search_zero_score_always_dropped(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"memory_id": "m1", "content": "real", "score": 0.5},
+        {"memory_id": "m2", "content": "pad", "score": 0.0}]}))
+    out = asyncio.run(S.hebbrix_search("q", collection_id="c1"))
+    assert [r["id"] for r in out["results"]] == ["m1"]
+
+
+def test_graph_query_reshapes_nested_payload(monkeypatch):
+    # REAL backend shape (scout-confirmed): results[] with source/target node
+    # objects (metadata as stringified JSON) + relationship_type.
+    fake = FakeResponse(200, {"results": [{
+        "source": {"name": "sarah", "type": "person",
+                   "metadata": "{\"spacy_label\": \"PERSON\"}"},
+        "target": {"name": "atlas", "metadata": "{\"entity_type\": \"object\"}"},
+        "relationship_type": "works_at", "valid_from": "2026-01-01",
+        "valid_to": None, "confidence": 0.876,
+        "properties": {"verb": "work", "source": "svo"}}],
+        "entity": "atlas", "total_count": 1})
+    _fake(monkeypatch, fake)
+    out = asyncio.run(S.hebbrix_graph_query("Atlas", collection_id="c1"))
+    assert out["entity"] == "atlas" and out["count"] == 1
+    r = out["relationships"][0]
+    assert r == {"from": "sarah", "to": "atlas", "type": "works_at",
+                 "valid_from": "2026-01-01", "confidence": 0.876}
+    assert "spacy_label" not in json.dumps(out)  # stringified metadata stripped
+    assert "properties" not in json.dumps(out)   # internal props stripped
+
+
+def test_graph_query_depth_clamped(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"relationships": []}))
+    asyncio.run(S.hebbrix_graph_query("x", depth=99, collection_id="c1"))
+    body = client.calls[-1][2]["json"]
+    assert body["depth"] == 5
+
+
+def test_export_json_bundles_memories_entities_profile(monkeypatch):
+    calls = {"n": 0}
+
+    class MultiClient(FakeClient):
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/memories" in url:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    return FakeResponse(200, {"items": [
+                        {"id": "m1", "content": "a"}], "next_cursor": None})
+                return FakeResponse(200, {"items": []})
+            if "/knowledge-graph/entities" in url:
+                return FakeResponse(200, {"entities": [{"name": "atlas", "type": "object"}]})
+            if "/profile/facts" in url:
+                return FakeResponse(200, {"static": [{"key": "db", "value": "pg"}]})
+            return FakeResponse(200, {})
+
+    client = MultiClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+    out = asyncio.run(S.hebbrix_export(collection_id="c1"))
+    assert out["memory_count"] == 1
+    assert out["memories"][0]["id"] == "m1"
+    assert out["entities"] == [{"name": "atlas", "type": "object", "mentions": None}]
+    assert out["profile"]["static"][0]["value"] == "pg"
+
+
+def test_export_markdown_renders_document(monkeypatch):
+    class MultiClient(FakeClient):
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/memories" in url:
+                return FakeResponse(200, {"items": [{"id": "m1", "content": "hello"}]}
+                                    if "cursor" not in kw.get("params", {}) else {"items": []})
+            return FakeResponse(200, {})
+    client = MultiClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+    out = asyncio.run(S.hebbrix_export(format="markdown", collection_id="c1"))
+    assert out["format"] == "markdown"
+    assert "# Hebbrix export" in out["document"] and "hello" in out["document"]
+
+
+def test_remember_many_posts_batch(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"created": 2, "failed": 0,
+                                                   "memory_ids": ["m1", "m2"]}))
+    out = asyncio.run(S.hebbrix_remember_many(["fact one", "fact two"], collection_id="c1"))
+    assert out["created"] == 2 and out["memory_ids"] == ["m1", "m2"]
+    method, url, kw = client.calls[-1]
+    assert method == "POST" and url.endswith("/memories/batch")
+    assert len(kw["json"]["memories"]) == 2
+
+
+def test_remember_many_falls_back_on_tier_gate(monkeypatch):
+    # /memories/batch is Starter+; a 403 must degrade to sequential raw writes.
+    class TierClient(FakeClient):
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            if url.endswith("/memories/batch"):
+                return FakeResponse(403, text="tier")
+            return FakeResponse(200, {"id": "seq"})
+    client = TierClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+    out = asyncio.run(S.hebbrix_remember_many(["a", "b"], collection_id="c1"))
+    assert out["fallback"] == "sequential" and out["created"] == 2
+
+
+def test_remember_many_requires_facts(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {}))
+    out = asyncio.run(S.hebbrix_remember_many([], collection_id="c1"))
+    assert "error" in out
+
+
+def test_ask_uses_reason_and_cites(monkeypatch):
+    class AskClient(FakeClient):
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            if url.endswith("/search/reason"):
+                return FakeResponse(200, {"answer": "Sarah does.", "sources": [
+                    {"memory_id": "m1", "content": "Sarah works on Atlas", "score": 0.9}]})
+            return FakeResponse(200, {})
+
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/knowledge-graph/entities" in url:
+                return FakeResponse(200, {"entities": []})
+            if "/profile/facts" in url:
+                return FakeResponse(200, {"static": []})
+            return FakeResponse(200, {})
+    client = AskClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+    out = asyncio.run(S.hebbrix_ask("who works on Atlas?", collection_id="c1"))
+    assert out["answer"] == "Sarah does."
+    assert out["citations"] == [{"id": "m1", "content": "Sarah works on Atlas", "score": 0.9}]
+
+
+def test_ask_falls_back_to_search_when_reason_unavailable(monkeypatch):
+    class AskClient(FakeClient):
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            if url.endswith("/search/reason"):
+                return FakeResponse(503, text="quota")
+            if url.endswith("/search"):
+                return FakeResponse(200, {"results": [
+                    {"memory_id": "m9", "content": "hit", "score": 0.7}]})
+            return FakeResponse(200, {})
+
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            return FakeResponse(200, {"entities": []} if "entities" in url else {"static": []})
+    client = AskClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+    out = asyncio.run(S.hebbrix_ask("q", collection_id="c1", include_graph=False))
+    assert out["answer"] is None
+    assert out["citations"][0]["id"] == "m9"
+    assert "reasoning unavailable" in out["note"]
+
+
+def test_mark_used_posts_relevance_feedback(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"status": "ok"}))
+    out = asyncio.run(S.hebbrix_mark_used("m1", helpful=True, query="who?"))
+    assert out["reinforced"] is True and out["recorded"] is True
+    method, url, kw = client.calls[-1]
+    assert url.endswith("/feedback/relevance")
+    assert kw["json"] == {"memory_id": "m1", "is_relevant": True, "query": "who?"}
 
 
 def test_error_responses_are_structured(monkeypatch):

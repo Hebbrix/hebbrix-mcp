@@ -134,23 +134,28 @@ A server-level instruction block teaches the model when to reach for each tool, 
     - `tags` (list, optional), `collection_id` (string, optional)
     - `extract` (bool, default false): false stores the text exactly (one memory); true runs fact-extraction and may create several atomic memories
     - `wait_for_index` (bool, default true): guarantees **memory-search** availability — `hebbrix_search` returns the fact the moment the call returns. It does **not** cover knowledge-graph enrichment (entities/timelines/graph), which lands asynchronously (~30s); the response's `graph_enrichment: "processing"` flags this.
+- `hebbrix_remember_many` - Store **many** facts in one call (one round-trip, one rate-limit hit). Pass `facts` (list of strings). Falls back to sequential writes on free/agent tiers.
 - `hebbrix_search` - Semantic search (hybrid vector + BM25 + graph retrieval).
     - `query` (string, required), `limit` (int, optional), `collection_id` (string, optional)
+    - `min_score` (float, default 0.0): drop weak matches — zero-relevance padding is always dropped; raise this to filter noise so you don't pay tokens for it.
 - `hebbrix_get` - Fetch one memory by id, with metadata.
 - `hebbrix_update` - Correct a memory **in place** (old versions are kept).
 - `hebbrix_forget` - Delete a memory by id.
 - `hebbrix_list` - List recent memories.
 - `hebbrix_history` - See how a memory changed over time.
+- `hebbrix_mark_used` - Reinforce a memory you actually used (`helpful=True` strengthens it, `False` weakens it) so recall improves over time.
+- `hebbrix_export` - Export a whole collection (memories + graph entities + profile) as JSON or Markdown, in one call.
 
 **Knowledge graph** — Hebbrix automatically extracts entities and relationships from the memories you write, on **every tier including agent mode**, so all the graph *reads* below (entities, timelines, traversal, contradictions) work in agent mode too. Only explicit graph *write* / inference operations require a Pro plan.
 
 - `hebbrix_search_entities` - List known entities (people, orgs, tools, places).
 - `hebbrix_entity_timeline` - What was true about an entity, and when.
-- `hebbrix_graph_query` - Traverse relationships out from a named entity; pass a `timestamp` for point-in-time truth. (Free-text questions: use `hebbrix_search`.)
+- `hebbrix_graph_query` - Traverse relationships out from a named entity; pass a `timestamp` for point-in-time truth. Results are trimmed (from/to/type/valid_from), not raw backend payloads. (Free-text questions: use `hebbrix_ask`.)
 - `hebbrix_contradictions` - Surface facts that conflict with each other.
 
 **Reasoning & account**
 
+- `hebbrix_ask` - **One-call GraphRAG.** Ask a natural-language question; it searches memory, synthesizes an answer with an LLM, cites the memory ids it used, and enriches with knowledge-graph relationships + your profile. Use instead of orchestrating search + graph + profile yourself.
 - `hebbrix_confidence` - How confident should the agent be before acting? Grounded in memory + past outcomes.
 - `hebbrix_log_decision` - Record a decision and its outcome; feeds future confidence. Right after a `hebbrix_confidence` check you can log just the `outcome` — the description auto-fills from what you asked.
 - `hebbrix_list_collections` - List the memory spaces this key can use.
@@ -244,7 +249,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 70 offline tests, no network needed
+pytest tests/ -q            # 82 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 
