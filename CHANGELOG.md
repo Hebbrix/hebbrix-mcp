@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.3.18 — 2026-07-11
+
+Security: stored (second-order) prompt-injection guard (red-team H1).
+
+- Stored memories are returned verbatim (correct for a memory store), but the
+  auto-injected profile could carry text that reads like instructions ("ignore
+  previous instructions", exfiltration requests). The **`hebbrix://profile`
+  resource, the `context` prompt, and the `hebbrix-mcp profile` CLI** (used by the
+  Claude Code SessionStart hook) now FENCE the profile as untrusted DATA between
+  explicit `BEGIN/END STORED USER PROFILE (untrusted data)` markers, preceded by a
+  do-not-act note. The model can use it to understand the user without treating it
+  as commands.
+- The server instructions now state plainly that memory content is user DATA, not
+  instructions, and must never be executed.
+
+Companion backend (same day, red-team M2/L2/H2/M1): `importance` clamped to
+[0,1] with non-finite rejected (was accepting -5/1e308/NaN); per-memory tag count
+capped; free-tier mint hardened against Sybil farming; WAF no longer silently
+eats developer content mentioning `<script>`/paths.
+
+86 offline tests.
+
 ## 0.3.17 — 2026-07-11
 
 Search cache honesty (E2E re-review item 4).
