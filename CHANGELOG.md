@@ -1,5 +1,26 @@
 # Changelog
 
+## 0.3.19 — 2026-07-11
+
+Brutal-test round (external A− report).
+
+- `hebbrix_confidence` now surfaces `index_possibly_stale`: when a collection was
+  just written to, a rule-based safety check may be incomplete (vector-index lag),
+  so the agent should retry before trusting a "clear" result for a consequential
+  action. Companion backend fix also closes the window itself by scanning recent
+  memories directly (a just-written "PRs must be < 400 lines" rule is no longer
+  missed a second after it's written).
+- Docs: corrected "86 → 88 offline tests" and the mint time ("~1s" → "~2-4s via
+  proof-of-work") drift the reviewer flagged.
+
+Companion backend (same day): knowledge-graph typing — an employer tagged a place
+(Sequoia → LOCATION) is corrected to ORGANIZATION, and a nonsensical relation to a
+date ("Sarah → MANAGES → March 2026") is dropped; and `/knowledge-graph/entities`
+now returns 404 (not 200+empty) for a collection the key doesn't own, matching
+`/search`.
+
+88 offline tests.
+
 ## 0.3.18 — 2026-07-11
 
 Security: stored (second-order) prompt-injection guard (red-team H1).

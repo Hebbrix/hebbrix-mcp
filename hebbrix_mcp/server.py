@@ -1019,6 +1019,11 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
            "reasoning": data.get("reasoning") or data.get("explanation")}
     if data.get("constraint_conflict"):
         out["constraint_conflict"] = data["constraint_conflict"]
+    # Surface the index-lag caveat: if the collection was just written to, a
+    # rule-based safety check may be incomplete — the agent should retry before
+    # trusting a "clear" result for a consequential action.
+    if data.get("index_possibly_stale"):
+        out["index_possibly_stale"] = True
     return _u(out)
 
 

@@ -19,7 +19,7 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 ## Quick start (no account needed)
 
-Add this to your MCP client config. On first run with no API key, the server mints a **free agent account** automatically (no email, no dashboard, ~1 second) and saves it to `~/.hebbrix/config.json`.
+Add this to your MCP client config. On first run with no API key, the server mints a **free agent account** automatically (no email, no dashboard, ~2-4 seconds via proof-of-work) and saves it to `~/.hebbrix/config.json`.
 
 ```json
 {
@@ -249,7 +249,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 86 offline tests, no network needed
+pytest tests/ -q            # 88 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 

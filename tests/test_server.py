@@ -297,6 +297,13 @@ def test_error_responses_are_structured(monkeypatch):
     assert out["error"].startswith("HTTP 500")
 
 
+def test_confidence_passes_index_stale_flag(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {"confidence": 0.3, "recommended_action": "ask_user",
+                                          "reasoning": "no grounding", "index_possibly_stale": True}))
+    out = asyncio.run(S.hebbrix_confidence("open a 600-line PR?", collection_id="c1"))
+    assert out.get("index_possibly_stale") is True
+
+
 def test_waf_html_403_becomes_clear_content_rejected(monkeypatch):
     # A WAF's raw HTML 403 must be surfaced as a clear "write did NOT succeed"
     # signal, not an opaque "HTTP 403: <html>..." that reads like an auth failure.
