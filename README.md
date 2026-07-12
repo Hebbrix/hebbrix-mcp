@@ -145,6 +145,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_history` - See how a memory changed over time.
 - `hebbrix_mark_used` - Reinforce a memory you actually used (`helpful=True` strengthens it, `False` weakens it) so recall improves over time.
 - `hebbrix_export` - Export a whole collection (memories + graph entities + profile) as JSON or Markdown, in one call.
+- `hebbrix_import` - The inverse of export: import a list of facts, an export JSON, or notes/markdown into a collection (restore a backup, migrate, or seed from `CLAUDE.md`).
 
 **Knowledge graph** — Hebbrix automatically extracts entities and relationships from the memories you write, on **every tier including agent mode**, so all the graph *reads* below (entities, timelines, traversal, contradictions) work in agent mode too. Only explicit graph *write* / inference operations require a Pro plan.
 
@@ -249,7 +250,7 @@ git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
 ./quick_setup.sh            # venv + editable install
 source venv/bin/activate
-pytest tests/ -q            # 88 offline tests, no network needed
+pytest tests/ -q            # 93 offline tests, no network needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 

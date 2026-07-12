@@ -2,7 +2,7 @@
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "hebbrix",
   "displayName": "Hebbrix Memory",
-  "version": "0.3.19",
+  "version": "0.3.20",
   "description": "Persistent long-term memory + temporal knowledge graph for Claude Code. Auto-loads your compiled profile into every session and gives Claude tools to remember, search, and reason over what matters.",
   "author": { "name": "Hebbrix", "email": "contact@hebbrix.com" },
   "homepage": "https://www.hebbrix.com",

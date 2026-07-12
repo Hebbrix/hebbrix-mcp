@@ -480,10 +480,44 @@ def _capture_usage(r: httpx.Response) -> None:
     _LAST_USAGE.set(usage)
 
 
+_LAST_USAGE_SIG: Any = None  # single-tenant only: last emitted usage "signature"
+
+
+def _usage_sig(u: dict) -> tuple:
+    """Coarse signature of a usage block: its status + which 50/75/90% band each
+    counter is in. Only a change in this signature is worth re-sending."""
+    def _band(d: Any) -> int:
+        d = d or {}
+        lim = d.get("limit") or 0
+        if lim <= 0:
+            return 0
+        pct = 100.0 * (d.get("used") or 0) / lim
+        for t in (90, 75, 50):
+            if pct >= t:
+                return t
+        return 0
+    return (u.get("status"), _band(u.get("writes")), _band(u.get("retrievals")))
+
+
 def _u(out: dict[str, Any]) -> dict[str, Any]:
-    """Attach the usage block to a tool result (agents relay it to humans)."""
+    """Attach the usage block to a tool result, but only when it MATERIALLY changes
+    (reviewer E2E-4). Sending ~90 tokens of unchanged quota on every call is real
+    context cost over a long session. Emit the full block on the first call, on a
+    status transition, on crossing a 50/75/90% band, and whenever the account is
+    constrained (warning/limited/read_only — the claim nudge matters); otherwise
+    omit it. Suppression is single-tenant only; hosted multi-tenant is per-request
+    so it always attaches."""
+    global _LAST_USAGE_SIG
     usage = _LAST_USAGE.get()
-    if usage and isinstance(out, dict):
+    if not (usage and isinstance(out, dict)):
+        return out
+    if not _LOCAL_CACHE:  # multi-tenant / hosted: no cross-request state
+        out.setdefault("hebbrix_usage", dict(usage))
+        return out
+    sig = _usage_sig(usage)
+    constrained = usage.get("status") in ("warning", "limited", "read_only")
+    if _LAST_USAGE_SIG is None or sig != _LAST_USAGE_SIG or constrained:
+        _LAST_USAGE_SIG = sig
         out.setdefault("hebbrix_usage", dict(usage))
     return out
 
@@ -691,6 +725,11 @@ async def hebbrix_remember_many(
     {"created", "failed", "memory_ids", ...}. wait_for_index defaults to False
     here (bulk writes are usually fire-and-forget); set True to block until all
     are searchable.
+
+    Tier note: the single-round-trip batch endpoint requires Starter+; on the
+    free / agent tier this transparently falls back to sequential writes (the
+    result carries "fallback": "sequential"), so it still works but isn't one
+    round-trip on that tier.
     """
     cid = _cid(collection_id)
     if not cid:
@@ -1259,6 +1298,64 @@ async def hebbrix_export(
         return _u({"format": "markdown", "collection_id": cid,
                    "document": _export_markdown(payload)})
     return _u(payload)
+
+
+def _import_facts(data: Any) -> list[str]:
+    """Extract memory strings from an import payload: a list (of strings or
+    {content} dicts), a hebbrix_export JSON dict (its "memories"), or a plain /
+    markdown string (one memory per non-empty, non-heading line, bullets stripped)."""
+    facts: list[str] = []
+    if isinstance(data, list):
+        for x in data:
+            if isinstance(x, str):
+                facts.append(x)
+            elif isinstance(x, dict) and x.get("content"):
+                facts.append(str(x["content"]))
+    elif isinstance(data, dict):
+        for m in (data.get("memories") or []):
+            c = m.get("content") if isinstance(m, dict) else None
+            if c:
+                facts.append(str(c))
+    elif isinstance(data, str):
+        for line in data.splitlines():
+            s = line.strip()
+            if not s or s.startswith("#") or s.startswith("---") or s.startswith("_"):
+                continue
+            s = re.sub(r"^[-*]\s+", "", s)          # bullet
+            s = re.sub(r"^\*\*[^*]+\*\*:\s*", "", s)  # "**id**: " export-md prefix
+            s = re.sub(r"\s*_\(created[^)]*\)_\s*$", "", s)  # trailing "_(created ...)_"
+            if s.strip():
+                facts.append(s.strip())
+    return [f.strip() for f in facts if f and f.strip()]
+
+
+@mcp.tool()
+async def hebbrix_import(
+    data: Any,
+    collection_id: Optional[str] = None,
+    wait_for_index: bool = False,
+) -> dict[str, Any]:
+    """Import memories into a collection — the inverse of hebbrix_export. Use it to
+    restore a backup, migrate a collection, or seed a new one from notes/CLAUDE.md.
+
+    `data` may be: a list of fact strings; a list of {"content": ...} objects; a
+    hebbrix_export JSON object (its "memories" are imported); or a plain/markdown
+    string (each non-empty, non-heading line becomes a memory, bullets stripped).
+
+    Returns {"imported", "failed", "memory_ids"}.
+    """
+    cid = _cid(collection_id)
+    if not cid:
+        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+    facts = _import_facts(data)
+    if not facts:
+        return {"error": "no importable memories found in `data` (expected a list "
+                         "of facts, an export JSON, or newline-separated text)"}
+    res = await hebbrix_remember_many(facts, collection_id=cid, wait_for_index=wait_for_index)
+    if isinstance(res, dict) and "error" in res:
+        return res
+    return _u({"imported": res.get("created", 0), "failed": res.get("failed", 0),
+               "memory_ids": res.get("memory_ids") or []})
 
 
 # --------------------------------------------------------------------------- #

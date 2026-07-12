@@ -58,11 +58,13 @@ class FakeClient:
 @pytest.fixture(autouse=True)
 def reset_usage():
     S._LAST_USAGE.set(None)  # per-request ContextVar, cleared between tests
+    S._LAST_USAGE_SIG = None  # usage-emission dedup signature (single-tenant)
     S._RECENT_WRITES.clear()  # process-global session caches — isolate each test
     S._RECENT_DELETES.clear()
     S._RECENT_CONFIDENCE.clear()
     yield
     S._LAST_USAGE.set(None)
+    S._LAST_USAGE_SIG = None
     S._RECENT_WRITES.clear()
     S._RECENT_DELETES.clear()
     S._RECENT_CONFIDENCE.clear()
@@ -78,7 +80,7 @@ def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 19
+        assert len(tools) == 20
         names = {t.name for t in tools}
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
                          "hebbrix_update", "hebbrix_forget", "hebbrix_list",
@@ -87,7 +89,8 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_contradictions", "hebbrix_confidence",
                          "hebbrix_log_decision", "hebbrix_list_collections",
                          "hebbrix_account_status", "hebbrix_export",
-                         "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used"):
+                         "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used",
+                         "hebbrix_import"):
             assert expected in names
         resources = await S.mcp.list_resources()
         assert [str(r.uri) for r in resources] == ["hebbrix://profile"]
@@ -190,6 +193,28 @@ def test_export_json_bundles_memories_entities_profile(monkeypatch):
     assert out["memories"][0]["id"] == "m1"
     assert out["entities"] == [{"name": "atlas", "type": "object", "mentions": None}]
     assert out["profile"]["static"][0]["value"] == "pg"
+
+
+def test_import_parses_list_dict_and_text(monkeypatch):
+    # pure parser, no network
+    assert S._import_facts(["a", "b"]) == ["a", "b"]
+    assert S._import_facts([{"content": "x"}, {"content": "y"}]) == ["x", "y"]
+    assert S._import_facts({"memories": [{"content": "m1"}, {"content": "m2"}]}) == ["m1", "m2"]
+    md = "# Hebbrix export\n\n## Memories\n- **abc**: fact one _(created 2026)_\n- fact two\n"
+    assert S._import_facts(md) == ["fact one", "fact two"]
+
+
+def test_import_writes_via_batch(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"created": 2, "failed": 0,
+                                                   "memory_ids": ["m1", "m2"]}))
+    out = asyncio.run(S.hebbrix_import(["fact one", "fact two"], collection_id="c1"))
+    assert out["imported"] == 2 and out["memory_ids"] == ["m1", "m2"]
+
+
+def test_import_rejects_empty(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {}))
+    out = asyncio.run(S.hebbrix_import([], collection_id="c1"))
+    assert "error" in out
 
 
 def test_export_markdown_renders_document(monkeypatch):
@@ -295,6 +320,35 @@ def test_error_responses_are_structured(monkeypatch):
     _fake(monkeypatch, FakeResponse(500, text="boom"))
     out = asyncio.run(S.hebbrix_get("m1"))
     assert out["error"].startswith("HTTP 500")
+
+
+def test_usage_block_omitted_when_unchanged(monkeypatch):
+    # E2E-4: full block on first call, omitted on an unchanged repeat, re-emitted
+    # when a threshold band is crossed.
+    hdr = lambda used: {  # noqa: E731
+        "X-Hebbrix-Tier": "shadow", "X-Hebbrix-Status": "ok",
+        "X-Hebbrix-Writes-Used": str(used), "X-Hebbrix-Writes-Limit": "300",
+        "X-Hebbrix-Retrievals-Used": "0", "X-Hebbrix-Retrievals-Limit": "2000"}
+    c1 = _fake(monkeypatch, FakeResponse(201, {"id": "m1"}, headers=hdr(10)))
+    out1 = asyncio.run(S.hebbrix_remember("a", collection_id="c1"))
+    assert "hebbrix_usage" in out1  # first call: emitted
+    c1._response = FakeResponse(201, {"id": "m2"}, headers=hdr(11))  # same band (<50%)
+    out2 = asyncio.run(S.hebbrix_remember("b", collection_id="c1"))
+    assert "hebbrix_usage" not in out2  # unchanged -> omitted
+    c1._response = FakeResponse(201, {"id": "m3"}, headers=hdr(160))  # crosses 50%
+    out3 = asyncio.run(S.hebbrix_remember("c", collection_id="c1"))
+    assert "hebbrix_usage" in out3  # band changed -> re-emitted
+
+
+def test_usage_block_always_emitted_when_constrained(monkeypatch):
+    hdr = {"X-Hebbrix-Tier": "shadow", "X-Hebbrix-Status": "warning",
+           "X-Hebbrix-Writes-Used": "290", "X-Hebbrix-Writes-Limit": "300",
+           "X-Hebbrix-Retrievals-Used": "0", "X-Hebbrix-Retrievals-Limit": "2000",
+           "X-Hebbrix-Claim": "uvx hebbrix-mcp claim --email you@x.com"}
+    c = _fake(monkeypatch, FakeResponse(201, {"id": "m1"}, headers=hdr))
+    asyncio.run(S.hebbrix_remember("a", collection_id="c1"))
+    out2 = asyncio.run(S.hebbrix_remember("b", collection_id="c1"))
+    assert "hebbrix_usage" in out2  # constrained -> always emitted (claim nudge)
 
 
 def test_confidence_passes_index_stale_flag(monkeypatch):

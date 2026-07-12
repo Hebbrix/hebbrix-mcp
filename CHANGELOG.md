@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.3.20 — 2026-07-12
+
+Full-E2E review round: import tool, quieter usage block.
+
+- **`hebbrix_import`** — the missing half of `hebbrix_export`. Import a list of
+  facts, a `hebbrix_export` JSON object, or plain/markdown notes into a collection.
+  Restore a backup, migrate a collection, or seed a new one from `CLAUDE.md`.
+- **`hebbrix_usage` is now sent only when it materially changes** (first call,
+  status transition, crossing a 50/75/90% band, or whenever the account is
+  constrained). Sending ~90 tokens of unchanged quota on every call was real
+  context cost over a long session; it's omitted when nothing changed. (Hosted
+  multi-tenant is per-request, so it always attaches there.)
+- `hebbrix_remember_many` docstring now notes the single-round-trip batch endpoint
+  is Starter+ and transparently falls back to sequential writes on the free/agent
+  tier (the result already carried `"fallback": "sequential"`).
+
+Companion backend (same day): knowledge-graph relationship extraction — fixed a
+factually-wrong copula edge ("Sarah Kim is the designer working on LedgerLite" no
+longer yields `sarah kim -is_a-> ledgerlite`), and added typed verb+preposition
+relations (`works_with` / `works_on` / `launches_on`) so the graph stops collapsing
+everything to `mentions`.
+
+93 offline tests.
+
 ## 0.3.19 — 2026-07-11
 
 Brutal-test round (external A− report).
