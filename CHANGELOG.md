@@ -1,5 +1,46 @@
 # Changelog
 
+## 0.3.21 — 2026-07-13
+
+Red-team hardening (adversarial agent report). Two of the six reported findings
+are client-layer; the rest are backend/infra and are NOT fixed here.
+
+### Fixed (this client)
+- **Retrieval payloads are now fenced as untrusted data (finding #4).** Only the
+  profile/context paths carried the untrusted-data marker; `hebbrix_search`,
+  `hebbrix_get`, `hebbrix_list`, `hebbrix_history` and `hebbrix_ask`
+  (citations/graph/profile) returned stored content to the model raw. A poisoned
+  memory (e.g. an exfiltration instruction) reached the model with no marker at
+  all. All retrieval paths now carry the marker; content is still returned
+  verbatim, and empty results carry no marker (no token cost).
+- **Quota exhaustion is now explicit, not a silent degrade (finding #1b).**
+  `hebbrix_ask` fell back to raw search hits behind a generic "reasoning
+  unavailable" note, indistinguishable from a transient blip. It now emits
+  `reasoning_disabled: "quota_exhausted"` (vs `"unavailable"` / `"no_answer"`)
+  and states that `answer` is null, the citations are RAW SEARCH HITS, and
+  retrying is pointless. `hebbrix_confidence` labels a 402 the same way instead
+  of returning a bare `HTTP 402`.
+- **`hebbrix_ask` fenced its profile.** It embedded the compiled profile — the
+  highest-risk injection surface — unfenced, while the resource/prompt paths
+  fenced it.
+
+### Documented
+- `SECURITY.md` now states the honest stored-memory injection threat model: the
+  untrusted-data marker is **advisory, not a security boundary**. It informs a
+  model; it cannot stop one. The real boundary belongs in agent policy.
+
+### NOT fixed here (backend / infra — tracked separately)
+- Reasoning-token metering overshot its cap 4.8x (481k used against a 100k
+  limit) — cost control is leaky/post-hoc. Backend.
+- Unvetted memories are compiled into auto-injected profile facts, including
+  actionable keys (`email_address`, `command`). Backend profile extraction.
+- Cross-entity contamination: a third party's facts were attributed to the user.
+  Backend entity resolution.
+- Contradiction detection returns 0 on same-attribute value conflicts. Backend.
+- WAF is inconsistent (blocks benign paths/code, passes real injection payloads).
+  AWS infra, not in any repo.
+
+
 ## 0.3.20 — 2026-07-12
 
 Full-E2E review round: import tool, quieter usage block.
