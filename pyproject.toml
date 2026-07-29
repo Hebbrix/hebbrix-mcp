@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hebbrix-mcp"
-version = "0.3.21"
+version = "0.3.22"
 description = "Hebbrix MCP server — long-term memory and knowledge graph for any MCP-compatible agent (Claude Desktop, Cline, Cursor, etc.)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -36,7 +36,11 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp[cli]>=1.0",
+    # Upper bound is REQUIRED: server.py imports `mcp.server.fastmcp.FastMCP`,
+    # which mcp 2.0 removed. A default install resolved mcp==2.0.0 and the CLI
+    # crashed on import (prod-readiness report 2026-07-29). Pin below 2.0 until the
+    # server is ported to the mcp 2.x API.
+    "mcp[cli]>=1.0,<2",
     "httpx>=0.27",
 ]
 
