@@ -19,6 +19,8 @@ agent mode and mints a free account automatically):
   HEBBRIX_MCP_HOST/PORT    bind address (streamable-http only)
   HEBBRIX_MCP_MULTI_TENANT hosted mode: authenticate each request from its own
                            Authorization header (one instance serves many users)
+  HEBBRIX_UPSTREAM_MAX_CONNECTIONS / HEBBRIX_UPSTREAM_MAX_KEEPALIVE
+                           optional API connection-pool sizing
 
 CLI subcommands: `hebbrix-mcp claim --email <you>` (upgrade an agent account),
 `hebbrix-mcp profile` (print the compiled profile — used by the Claude Code
@@ -68,6 +70,22 @@ INTERNAL_SECRET = os.environ.get("HEBBRIX_MCP_INTERNAL_SECRET", "")
 GUEST_TTL_SECONDS = max(300, int(os.environ.get("HEBBRIX_MCP_GUEST_TTL_SECONDS", "1209600")))
 SESSION_COOKIE = "hebbrix_mcp_session"
 _API_BASE_FROM_ENV = "HEBBRIX_API_BASE" in os.environ
+
+# A hosted MCP task can receive more simultaneous requests than httpx's default
+# keep-alive pool retains (20). Keeping the pool at least as large as a normal
+# burst avoids making later requests repeat a TCP/TLS handshake, while HTTP/2
+# lets concurrent requests share established connections when the upstream
+# supports it. These are process-local sockets, not extra compute capacity.
+UPSTREAM_MAX_CONNECTIONS = max(
+    1, int(os.environ.get("HEBBRIX_UPSTREAM_MAX_CONNECTIONS", "128"))
+)
+UPSTREAM_MAX_KEEPALIVE = min(
+    UPSTREAM_MAX_CONNECTIONS,
+    max(1, int(os.environ.get("HEBBRIX_UPSTREAM_MAX_KEEPALIVE", "64"))),
+)
+UPSTREAM_KEEPALIVE_EXPIRY = max(
+    5.0, float(os.environ.get("HEBBRIX_UPSTREAM_KEEPALIVE_EXPIRY", "30"))
+)
 
 # Saved credentials from a previous auto-provision (agent mode). Env vars win.
 CONFIG_PATH = Path(os.environ.get("HEBBRIX_CONFIG", "~/.hebbrix/config.json")).expanduser()
@@ -420,7 +438,14 @@ def _client() -> httpx.AsyncClient:
     global _SHARED_CLIENT
     if _SHARED_CLIENT is None or _SHARED_CLIENT.is_closed:
         _SHARED_CLIENT = httpx.AsyncClient(
-            timeout=30.0, headers={"Content-Type": "application/json"}
+            http2=True,
+            timeout=httpx.Timeout(30.0, connect=5.0, pool=5.0),
+            limits=httpx.Limits(
+                max_connections=UPSTREAM_MAX_CONNECTIONS,
+                max_keepalive_connections=UPSTREAM_MAX_KEEPALIVE,
+                keepalive_expiry=UPSTREAM_KEEPALIVE_EXPIRY,
+            ),
+            headers={"Content-Type": "application/json"},
         )
     return _SHARED_CLIENT
 

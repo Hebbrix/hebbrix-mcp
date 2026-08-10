@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hebbrix-mcp"
-version = "0.4.0"
+version = "0.4.1"
 description = "Hebbrix MCP server — long-term memory and knowledge graph for any MCP-compatible agent (Claude Desktop, Cline, Cursor, etc.)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -41,7 +41,7 @@ dependencies = [
     # crashed on import (prod-readiness report 2026-07-29). Pin below 2.0 until the
     # server is ported to the mcp 2.x API.
     "mcp[cli]>=1.0,<2",
-    "httpx>=0.27",
+    "httpx[http2]>=0.27",
 ]
 
 [project.optional-dependencies]

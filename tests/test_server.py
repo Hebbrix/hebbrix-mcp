@@ -84,6 +84,29 @@ def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
     return client
 
 
+def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
+    captured = {}
+
+    class CapturingClient:
+        is_closed = False
+
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(S, "_SHARED_CLIENT", None)
+    monkeypatch.setattr(S.httpx, "AsyncClient", CapturingClient)
+
+    client = S._client()
+
+    assert isinstance(client, CapturingClient)
+    assert captured["http2"] is True
+    limits = captured["limits"]
+    assert limits.max_connections == S.UPSTREAM_MAX_CONNECTIONS
+    assert limits.max_keepalive_connections == S.UPSTREAM_MAX_KEEPALIVE
+    assert S.UPSTREAM_MAX_KEEPALIVE >= 50
+    assert captured["timeout"].connect == 5.0
+
+
 # ------------------------------------------------------------- registration
 def test_all_tools_resources_prompts_registered():
     async def check():
