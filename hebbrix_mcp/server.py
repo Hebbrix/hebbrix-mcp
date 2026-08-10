@@ -26,6 +26,10 @@ plugin's SessionStart hook).
 """
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import re
@@ -33,17 +37,21 @@ import sys
 import time
 from collections import deque
 from contextvars import ContextVar
+from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Optional
 from urllib.parse import quote
 
 import httpx
 from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp.exceptions import ToolError
 
 # Multi-tenant (hosted) mode: each HTTP request's own Authorization header is
 # the key, so ONE deployed instance serves many users (the standard hosted-MCP
 # pattern). Set per-request by _HeaderAuthMiddleware; empty = use global KEY.
 _REQUEST_KEY: ContextVar[str] = ContextVar("hebbrix_request_key", default="")
+_REQUEST_COLLECTION: ContextVar[str] = ContextVar("hebbrix_request_collection", default="")
+_REQUEST_HOSTED: ContextVar[bool] = ContextVar("hebbrix_request_hosted", default=False)
 
 BASE = os.environ.get("HEBBRIX_API_BASE", "https://api.hebbrix.com/v1").rstrip("/")
 KEY = os.environ.get("HEBBRIX_API_KEY", "")
@@ -54,6 +62,11 @@ PORT = int(os.environ.get("HEBBRIX_MCP_PORT", "8080"))
 # server's key. `_API_BASE_FROM_ENV` lets a saved api_base be honored on reload
 # while an explicit env var still wins.
 MULTI_TENANT = os.environ.get("HEBBRIX_MCP_MULTI_TENANT", "").lower() in ("1", "true", "yes")
+ACCOUNTLESS_HOSTED = os.environ.get("HEBBRIX_MCP_ACCOUNTLESS", "").lower() in ("1", "true", "yes")
+SESSION_SECRET = os.environ.get("HEBBRIX_MCP_SESSION_SECRET", "")
+INTERNAL_SECRET = os.environ.get("HEBBRIX_MCP_INTERNAL_SECRET", "")
+GUEST_TTL_SECONDS = max(300, int(os.environ.get("HEBBRIX_MCP_GUEST_TTL_SECONDS", "1209600")))
+SESSION_COOKIE = "hebbrix_mcp_session"
 _API_BASE_FROM_ENV = "HEBBRIX_API_BASE" in os.environ
 
 # Saved credentials from a previous auto-provision (agent mode). Env vars win.
@@ -423,7 +436,23 @@ def _auth_headers() -> dict[str, str]:
 
 
 def _cid(collection_id: Optional[str]) -> Optional[str]:
-    return collection_id or DEFAULT_COLLECTION or None
+    return collection_id or _REQUEST_COLLECTION.get() or DEFAULT_COLLECTION or None
+
+
+def _fail(message: str, status: Optional[int] = None, **extra: Any) -> dict[str, Any]:
+    """Return a structured local error, but a real MCP tool error when hosted.
+
+    FastMCP only sets ``isError=true`` when a tool raises. Returning
+    ``{"error": ...}`` looks successful to MCP clients and was the reason an
+    invalid hosted key could fail invisibly inside a HTTP-200 tool result.
+    """
+    out: dict[str, Any] = {"error": message}
+    if status is not None:
+        out["status"] = status
+    out.update(extra)
+    if _REQUEST_HOSTED.get():
+        raise ToolError(json.dumps(out, separators=(",", ":")))
+    return out
 
 
 def _err(r: httpx.Response) -> dict[str, Any]:
@@ -528,6 +557,8 @@ def _u(out: dict[str, Any]) -> dict[str, Any]:
     omit it. Suppression is single-tenant only; hosted multi-tenant is per-request
     so it always attaches."""
     global _LAST_USAGE_SIG
+    if isinstance(out, dict) and out.get("error") and _REQUEST_HOSTED.get():
+        raise ToolError(json.dumps(out, separators=(",", ":")))
     usage = _LAST_USAGE.get()
     if not (usage and isinstance(out, dict)):
         return out
@@ -572,7 +603,9 @@ async def _patch(path: str, body: dict) -> Any:
 async def _delete(path: str) -> dict[str, Any]:
     r = await _client().delete(f"{BASE}{path}", headers=_auth_headers())
     _capture_usage(r)
-    return {"status": r.status_code, "ok": r.status_code < 400}
+    return (_err(r) | {"ok": False}) if r.status_code >= 400 else {
+        "status": r.status_code, "ok": True
+    }
 
 
 def _mem_row(m: dict) -> dict[str, Any]:
@@ -686,16 +719,32 @@ async def hebbrix_remember(
     """
     cid = _cid(collection_id)
     if not cid:
-        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+        return _fail("no collection_id is available for this MCP session")
     if extract:
         # Smart endpoint: LLM fact-extraction into atomic memories.
-        body: dict[str, Any] = {"content": content, "collection_id": cid,
-                                "infer": True, "wait_for_index": wait_for_index}
+        body: dict[str, Any] = {
+            "content": content,
+            "collection_id": cid,
+            "infer": True,
+            "wait_for_index": wait_for_index,
+            # The production API defaults inference to async. A caller asking
+            # for read-after-write must explicitly select the synchronous
+            # contract; fire-and-forget gets a truthful 202/job response.
+            "async_dispatch": not wait_for_index,
+        }
         if tags:
             body["tags"] = tags
         data = await _post("/memories", body)
         if "error" in data:
-            return data
+            return _u(data)
+        if data.get("job_id"):
+            return _u({
+                "job_id": data.get("job_id"),
+                "status": data.get("status", "accepted"),
+                "poll_url": data.get("poll_url"),
+                "searchable": False,
+                "graph_enrichment": "queued",
+            })
         results = data.get("results") or []
         # Cache each extracted memory so it's locally recallable this session.
         for it in results:
@@ -753,13 +802,14 @@ async def hebbrix_remember_many(
     """
     cid = _cid(collection_id)
     if not cid:
-        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+        return _fail("no collection_id is available for this MCP session")
     facts = [f for f in (facts or []) if isinstance(f, str) and f.strip()]
     if not facts:
-        return {"error": "pass a non-empty list of fact strings"}
+        return _fail("pass a non-empty list of fact strings")
     if len(facts) > 100:
-        return {"error": "at most 100 facts per call; split into batches"}
-    body = {"memories": [{"content": f, "collection_id": cid} for f in facts],
+        return _fail("at most 100 facts per call; split into batches")
+    body = {"collection_id": cid,
+            "memories": [{"content": f, "collection_id": cid} for f in facts],
             "wait_for_index": wait_for_index}
     data = await _post("/memories/batch", body)
     # Batch write is tier-gated (Starter+). On 403/404 fall back to sequential
@@ -809,7 +859,7 @@ async def hebbrix_search(
     """
     cid = _cid(collection_id)
     if not cid:
-        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+        return _fail("no collection_id is available for this MCP session")
     limit = max(1, min(int(limit), 100))
     min_score = max(0.0, min(float(min_score), 1.0))
     data = await _post("/search", {"query": query, "collection_id": cid, "limit": limit})
@@ -905,7 +955,7 @@ async def hebbrix_update(
     the moment this returns (read-after-write). Set False for fire-and-forget.
     """
     if content is None and importance is None:
-        return {"error": "pass content and/or importance to update"}
+        return _fail("pass content and/or importance to update")
     if importance is not None:
         importance = max(0.0, min(float(importance), 1.0))
     data = await _patch(f"/memories/{memory_id}", {
@@ -938,7 +988,7 @@ async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> 
     """List recent memories in a collection."""
     cid = _cid(collection_id)
     if not cid:
-        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+        return _fail("no collection_id is available for this MCP session")
     limit = max(1, min(int(limit), 200))
     data = await _get("/memories", {"collection_id": cid, "limit": limit})
     if "error" in data:
@@ -1112,7 +1162,7 @@ async def hebbrix_ask(
     """
     cid = _cid(collection_id)
     if not cid:
-        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+        return _fail("no collection_id is available for this MCP session")
     out: dict[str, Any] = {"question": question}
     # 1) Synthesized answer + citations via the secure reasoning endpoint (it does
     #    scoped hybrid retrieval + LLM + citations). Fall back to plain search so
@@ -1227,8 +1277,8 @@ async def hebbrix_log_decision(
             decision_type = str(last["recommended_action"])
         auto_linked = True
     if not description:
-        return {"error": "pass a description (or call hebbrix_confidence first, "
-                         "then log just the outcome to auto-fill it)"}
+        return _fail("pass a description (or call hebbrix_confidence first, "
+                     "then log just the outcome to auto-fill it)")
     data = await _post("/decisions", {
         "description": description, "outcome": outcome, "decision_type": decision_type,
         "collection_id": _cid(collection_id)})
@@ -1258,6 +1308,37 @@ async def hebbrix_account_status() -> dict[str, Any]:
     (auto-provisioned account), relay the claim command to the human when usage
     status is 'warning' or worse — claiming is one command and keeps all memories."""
     return _u(await _get("/agent-signup/whoami"))
+
+
+@mcp.tool()
+async def hebbrix_claim_start(email: str) -> dict[str, Any]:
+    """Keep an accountless guest memory permanently by starting email claim.
+
+    Only call this after the human explicitly asks to claim/keep the guest
+    memory and provides the email address. Hebbrix sends a six-digit code to
+    that address; pass the code to ``hebbrix_claim_verify``. The same memory,
+    collection, and guest credential carry over—nothing is migrated or reset.
+    """
+    email = str(email or "").strip()
+    if not email or "@" not in email or len(email) > 320:
+        return _fail("pass a valid email address to start claiming this memory")
+    data = await _post("/agent-signup/claim", {"email": email})
+    return _u(data)
+
+
+@mcp.tool()
+async def hebbrix_claim_verify(code: str) -> dict[str, Any]:
+    """Finish claiming a guest memory with the emailed six-digit code.
+
+    Only call after ``hebbrix_claim_start`` and after the human supplies the
+    code. On success the same memories remain available and guest expiry/caps
+    are replaced by the normal claimed-account tier.
+    """
+    code = str(code or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        return _fail("the claim verification code must be exactly six digits")
+    data = await _post("/agent-signup/claim/verify", {"code": code})
+    return _u(data)
 
 
 # --------------------------------------------------------------------------- #
@@ -1296,7 +1377,7 @@ async def hebbrix_export(
     """
     cid = _cid(collection_id)
     if not cid:
-        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+        return _fail("no collection_id is available for this MCP session")
     # Pull memories in pages so a large space exports fully (not just the first N).
     memories: list[dict[str, Any]] = []
     seen_ids: set = set()
@@ -1395,11 +1476,11 @@ async def hebbrix_import(
     """
     cid = _cid(collection_id)
     if not cid:
-        return {"error": "no collection_id and HEBBRIX_COLLECTION_ID not set"}
+        return _fail("no collection_id is available for this MCP session")
     facts = _import_facts(data)
     if not facts:
-        return {"error": "no importable memories found in `data` (expected a list "
-                         "of facts, an export JSON, or newline-separated text)"}
+        return _fail("no importable memories found in `data` (expected a list "
+                     "of facts, an export JSON, or newline-separated text)")
     res = await hebbrix_remember_many(facts, collection_id=cid, wait_for_index=wait_for_index)
     if isinstance(res, dict) and "error" in res:
         return res
@@ -1532,8 +1613,215 @@ async def context() -> str:
 
 
 # --------------------------------------------------------------------------- #
-# Entry point                                                                  #
+# Hosted identity + entry point                                                #
 # --------------------------------------------------------------------------- #
+_AUTH_COLLECTION_CACHE: dict[str, tuple[str, float]] = {}
+
+
+def _b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+
+def _b64url_decode(value: str) -> bytes:
+    return base64.urlsafe_b64decode(value + "=" * (-len(value) % 4))
+
+
+def _session_cookie_value(api_key: str, collection_id: str, expires_at: int) -> str:
+    """Create a compact signed guest session carried by the MCP HTTP client.
+
+    The API key belongs to the guest and is only sent in a Secure, HttpOnly
+    cookie. Signing makes the stateless cookie safe across multiple MCP replicas
+    without introducing a server-side session database.
+    """
+    if len(SESSION_SECRET) < 32:
+        raise RuntimeError("HEBBRIX_MCP_SESSION_SECRET must be at least 32 characters")
+    payload = _b64url(json.dumps({
+        "v": 1, "k": api_key, "c": collection_id, "e": int(expires_at)
+    }, separators=(",", ":")).encode())
+    signature = _b64url(hmac.new(
+        SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
+    ).digest())
+    return f"{payload}.{signature}"
+
+
+def _verify_session_cookie(value: str) -> Optional[dict[str, Any]]:
+    """Verify and decode a guest cookie; return None for any invalid input."""
+    if not value or len(SESSION_SECRET) < 32:
+        return None
+    try:
+        payload, supplied = value.split(".", 1)
+        expected = _b64url(hmac.new(
+            SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
+        ).digest())
+        if not hmac.compare_digest(expected, supplied):
+            return None
+        data = json.loads(_b64url_decode(payload))
+        if data.get("v") != 1 or int(data.get("e", 0)) <= int(time.time()):
+            return None
+        if not (str(data.get("k", "")).startswith("mem_") and data.get("c")):
+            return None
+        return data
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+def _cookie_from_headers(headers: dict[str, str]) -> tuple[Optional[str], bool]:
+    raw = headers.get("cookie", "")
+    if not raw:
+        return None, False
+    try:
+        parsed = SimpleCookie()
+        parsed.load(raw)
+        morsel = parsed.get(SESSION_COOKIE)
+        return (morsel.value if morsel else None), bool(morsel)
+    except Exception:
+        return None, SESSION_COOKIE in raw
+
+
+def _client_ip(scope: dict[str, Any], headers: dict[str, str]) -> str:
+    """Use the ALB-appended rightmost XFF hop, falling back to the ASGI peer."""
+    forwarded = headers.get("x-forwarded-for", "")
+    candidate = forwarded.split(",")[-1].strip() if forwarded else ""
+    if not candidate:
+        peer = scope.get("client") or ("unknown", 0)
+        candidate = str(peer[0])
+    try:
+        return str(ipaddress.ip_address(candidate))
+    except ValueError:
+        return "unknown"
+
+
+def _hosted_ip_headers(client_ip: str) -> dict[str, str]:
+    if len(INTERNAL_SECRET) < 32:
+        raise RuntimeError("HEBBRIX_MCP_INTERNAL_SECRET must be at least 32 characters")
+    timestamp = int(time.time())
+    message = f"v1\n{timestamp}\n{client_ip}".encode()
+    signature = hmac.new(INTERNAL_SECRET.encode(), message, hashlib.sha256).hexdigest()
+    return {
+        "X-Hebbrix-MCP-Client-IP": client_ip,
+        "X-Hebbrix-MCP-Timestamp": str(timestamp),
+        "X-Hebbrix-MCP-Signature": signature,
+    }
+
+
+async def _mint_hosted_guest(client_ip: str, caller: str) -> dict[str, Any]:
+    """Mint one bounded shadow tenant for an unauthenticated MCP initialize."""
+    try:
+        response = await _client().post(
+            f"{BASE}/agent-signup",
+            json={"agent_caller": (caller or "hosted-mcp")[:64]},
+            headers=_hosted_ip_headers(client_ip),
+        )
+    except Exception as exc:
+        return {"error": f"accountless onboarding is temporarily unavailable: {exc}",
+                "status": 503}
+    if response.status_code != 201:
+        detail = response.text[:500] if response.text else "signup rejected"
+        return {"error": f"accountless onboarding failed: HTTP {response.status_code}: {detail}",
+                "status": response.status_code}
+    data = response.json()
+    if not (data.get("api_key") and data.get("collection_id")):
+        return {"error": "accountless onboarding returned an incomplete identity",
+                "status": 502}
+    return data
+
+
+def _auth_cache_key(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+async def _default_collection_for_token(token: str) -> tuple[Optional[str], Optional[dict]]:
+    """Validate an explicit bearer and resolve its default collection once."""
+    now = time.monotonic()
+    cache_key = _auth_cache_key(token)
+    cached = _AUTH_COLLECTION_CACHE.get(cache_key)
+    if cached and cached[1] > now:
+        return cached[0], None
+    try:
+        response = await _client().get(
+            f"{BASE}/collections/default",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+    except Exception:
+        return None, {"error": "Hebbrix identity service is temporarily unavailable",
+                      "status": 503}
+    if response.status_code >= 400:
+        status_code = 401 if response.status_code in (401, 403) else response.status_code
+        return None, {"error": "The Hebbrix bearer token is invalid or unavailable",
+                      "status": status_code}
+    collection_id = str((response.json() or {}).get("id") or "")
+    if not collection_id:
+        return None, {"error": "No default collection is available for this key",
+                      "status": 502}
+    if len(_AUTH_COLLECTION_CACHE) >= 4096:
+        expired = [key for key, (_, expiry) in _AUTH_COLLECTION_CACHE.items() if expiry <= now]
+        for key in expired[:1024]:
+            _AUTH_COLLECTION_CACHE.pop(key, None)
+        if len(_AUTH_COLLECTION_CACHE) >= 4096:
+            _AUTH_COLLECTION_CACHE.pop(next(iter(_AUTH_COLLECTION_CACHE)))
+    _AUTH_COLLECTION_CACHE[cache_key] = (collection_id, now + 600.0)
+    return collection_id, None
+
+
+async def _buffer_request_body(receive, maximum: int = 1024 * 1024):
+    upstream_receive = receive
+    messages: list[dict[str, Any]] = []
+    body = bytearray()
+    while True:
+        message = await receive()
+        messages.append(message)
+        if message.get("type") == "http.request":
+            body.extend(message.get("body", b""))
+            if len(body) > maximum:
+                raise ValueError("request body too large")
+            if not message.get("more_body", False):
+                break
+        elif message.get("type") == "http.disconnect":
+            break
+    queue = deque(messages)
+
+    async def replay():
+        if queue:
+            return queue.popleft()
+        # Starlette's disconnect watcher may call receive again after consuming
+        # the request. Delegate to the real ASGI channel so it can observe
+        # http.disconnect; returning endless synthetic empty requests spins the
+        # watcher and prevents the MCP response from being sent.
+        return await upstream_receive()
+
+    return bytes(body), replay
+
+
+def _initialize_caller(body: bytes) -> Optional[str]:
+    try:
+        payload = json.loads(body or b"{}")
+        if not isinstance(payload, dict) or payload.get("method") != "initialize":
+            return None
+        params = payload.get("params") or {}
+        info = params.get("clientInfo") or {}
+        return str(info.get("name") or "hosted-mcp")[:64]
+    except (ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+
+_SECURITY_HEADERS = (
+    (b"strict-transport-security", b"max-age=31536000; includeSubDomains"),
+    (b"x-content-type-options", b"nosniff"),
+    (b"referrer-policy", b"no-referrer"),
+    (b"cache-control", b"no-store"),
+)
+
+
+async def _send_json(send, status_code: int, payload: dict[str, Any], head: bool = False):
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers = [(b"content-type", b"application/json"),
+               (b"content-length", str(len(body)).encode()), *_SECURITY_HEADERS]
+    if status_code == 401:
+        headers.append((b"www-authenticate", b"Bearer"))
+    await send({"type": "http.response.start", "status": status_code, "headers": headers})
+    await send({"type": "http.response.body", "body": b"" if head else body})
+
+
 class _HeaderAuthMiddleware:
     """ASGI middleware for hosted (multi-tenant) mode: stashes each request's
     Bearer token in a contextvar so tool calls use the CALLER's key, never a
@@ -1548,37 +1836,102 @@ class _HeaderAuthMiddleware:
             # Health-probe bypass: a hosted load balancer needs an
             # unauthenticated 200. Scoped to GET /healthz|/health so it can
             # never expose an MCP endpoint without a bearer.
-            if scope.get("method") == "GET" and scope.get("path", "") in ("/healthz", "/health"):
-                body = b'{"status":"ok","service":"hebbrix-mcp"}'
-                await send({"type": "http.response.start", "status": 200, "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                ]})
-                await send({"type": "http.response.body", "body": body})
+            method = str(scope.get("method", "GET")).upper()
+            if method in ("GET", "HEAD") and scope.get("path", "") in ("/healthz", "/health"):
+                await _send_json(send, 200, {
+                    "status": "ok", "service": "hebbrix-mcp", "version": _SERVER_VERSION
+                }, head=method == "HEAD")
                 return
             headers = {k.decode().lower(): v.decode()
                        for k, v in (scope.get("headers") or [])}
             auth = headers.get("authorization", "")
             token = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
-            if not token:
-                # Multi-tenant requires a per-request key. Reject here rather
-                # than let the request fall through — never serve it with a
-                # server-side key.
-                body = (b'{"error":{"code":"UNAUTHORIZED","message":"This Hebbrix '
-                        b'MCP endpoint requires an Authorization: Bearer <hebbrix-api-key> '
-                        b'header on every request."}}')
-                await send({"type": "http.response.start", "status": 401, "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                    (b"www-authenticate", b"Bearer"),
-                ]})
-                await send({"type": "http.response.body", "body": body})
+            collection_id = ""
+            cookie_value, cookie_present = _cookie_from_headers(headers)
+            guest_cookie = _verify_session_cookie(cookie_value or "") if cookie_value else None
+            set_cookie: Optional[str] = None
+
+            # Explicit bearer always wins over the guest cookie. Validate it at
+            # the MCP boundary and cache only its collection id (never the token).
+            if token:
+                collection_id, auth_error = await _default_collection_for_token(token)
+                if auth_error:
+                    await _send_json(send, int(auth_error["status"]), auth_error)
+                    return
+            elif guest_cookie:
+                token = str(guest_cookie["k"])
+                collection_id = str(guest_cookie["c"])
+                # Sliding session: active guest/claimed memories do not become
+                # unreachable merely because 14 days passed since the original
+                # handshake. The backend remains authoritative for actual guest
+                # expiry and usage limits.
+                refreshed = _session_cookie_value(
+                    token, collection_id, int(time.time()) + GUEST_TTL_SECONDS
+                )
+                set_cookie = (
+                    f"{SESSION_COOKIE}={refreshed}; Max-Age={GUEST_TTL_SECONDS}; "
+                    "Path=/mcp; Secure; HttpOnly; SameSite=Lax"
+                )
+            elif cookie_present:
+                # Never silently mint a replacement identity for a malformed or
+                # expired cookie: that would make existing memories appear lost.
+                await _send_json(send, 401, {
+                    "error": "The hosted Hebbrix guest session is invalid or expired. "
+                             "Remove the stale cookie to start a new guest memory, or "
+                             "connect with Authorization: Bearer <hebbrix-api-key>."
+                })
                 return
-            reset = _REQUEST_KEY.set(token)
+            elif ACCOUNTLESS_HOSTED and method == "POST" and scope.get("path") == "/mcp":
+                try:
+                    raw_body, receive = await _buffer_request_body(receive)
+                except ValueError:
+                    await _send_json(send, 413, {"error": "MCP request body is too large"})
+                    return
+                caller = _initialize_caller(raw_body)
+                if caller:
+                    guest = await _mint_hosted_guest(_client_ip(scope, headers), caller)
+                    if guest.get("error"):
+                        await _send_json(send, int(guest.get("status", 503)), guest)
+                        return
+                    token = str(guest["api_key"])
+                    collection_id = str(guest["collection_id"])
+                    max_age = GUEST_TTL_SECONDS
+                    cookie = _session_cookie_value(
+                        token, collection_id, int(time.time()) + max_age
+                    )
+                    set_cookie = (
+                        f"{SESSION_COOKIE}={cookie}; Max-Age={max_age}; Path=/mcp; "
+                        "Secure; HttpOnly; SameSite=Lax"
+                    )
+            if not token:
+                await _send_json(send, 401, {
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "Initialize once without credentials for a free guest "
+                                   "memory, or send Authorization: Bearer <hebbrix-api-key>."
+                    }
+                })
+                return
+
+            async def secure_send(message):
+                if message.get("type") == "http.response.start":
+                    response_headers = list(message.get("headers") or [])
+                    present = {k.lower() for k, _ in response_headers}
+                    response_headers.extend((k, v) for k, v in _SECURITY_HEADERS if k not in present)
+                    if set_cookie:
+                        response_headers.append((b"set-cookie", set_cookie.encode()))
+                    message = {**message, "headers": response_headers}
+                await send(message)
+
+            reset_key = _REQUEST_KEY.set(token)
+            reset_collection = _REQUEST_COLLECTION.set(collection_id or "")
+            reset_hosted = _REQUEST_HOSTED.set(True)
             try:
-                await self.app(scope, receive, send)
+                await self.app(scope, receive, secure_send)
             finally:
-                _REQUEST_KEY.reset(reset)
+                _REQUEST_HOSTED.reset(reset_hosted)
+                _REQUEST_COLLECTION.reset(reset_collection)
+                _REQUEST_KEY.reset(reset_key)
         else:
             await self.app(scope, receive, send)
 
@@ -1701,10 +2054,17 @@ def run() -> None:
             raise SystemExit("HEBBRIX_MCP_MULTI_TENANT requires --transport streamable-http")
         import uvicorn
 
+        if ACCOUNTLESS_HOSTED and (len(SESSION_SECRET) < 32 or len(INTERNAL_SECRET) < 32):
+            raise SystemExit(
+                "HEBBRIX_MCP_ACCOUNTLESS requires HEBBRIX_MCP_SESSION_SECRET and "
+                "HEBBRIX_MCP_INTERNAL_SECRET (at least 32 characters each)"
+            )
+
         mcp.settings.stateless_http = True  # tool runs inside the request that carried the header
         app = _HeaderAuthMiddleware(mcp.streamable_http_app())
+        auth_mode = "accountless guest + optional bearer" if ACCOUNTLESS_HOSTED else "per-request bearer"
         print(f"hebbrix-mcp: multi-tenant streamable-http on {HOST}:{PORT} "
-              "(per-request Authorization: Bearer <key>)", file=sys.stderr)
+              f"({auth_mode})", file=sys.stderr)
         uvicorn.run(app, host=HOST, port=PORT, log_level="warning")
         return
 

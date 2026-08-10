@@ -1,5 +1,29 @@
 # Changelog
 
+## 0.4.0 — 2026-08-10
+
+Hosted accountless MCP and contract hardening.
+
+- The official hosted endpoint can mint an isolated, bounded guest tenant during
+  an unauthenticated MCP `initialize`; the identity is carried in a Secure,
+  HttpOnly, signed cookie, so no account, email, local command, or pasted API key
+  is required.
+- Explicit bearer keys are validated at the MCP boundary and their default
+  collection is resolved automatically. Invalid keys now fail before the client
+  sees a successful handshake.
+- Two explicit-consent claim tools let a guest keep the same memory permanently
+  from inside any agent; the hosted session refreshes while it remains active.
+- Hosted tool failures now use MCP `isError` semantics instead of returning a
+  success result containing an `error` field.
+- Smart ingestion explicitly selects synchronous inference when
+  `wait_for_index=true`; async ingestion returns a truthful job id and never
+  claims the memory is already searchable.
+- Batch/import writes carry collection scope at both the batch and item boundary.
+- HTTP/TLS connection pooling, guest-cookie isolation, HEAD health probes, HSTS,
+  no-store, and content-type hardening are covered by offline tests.
+
+108 offline tests.
+
 ## 0.3.21 — 2026-07-13
 
 Red-team hardening (adversarial agent report). Two of the six reported findings

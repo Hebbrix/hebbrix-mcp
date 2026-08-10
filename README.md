@@ -17,6 +17,20 @@ Your agent forgets everything when the session ends. This fixes that, and goes f
 
 Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other MCP client.
 
+### Fastest setup: hosted, no account
+
+For an HTTP-capable MCP client, this is the entire setup:
+
+```json
+{ "mcpServers": { "hebbrix": { "url": "https://mcp.hebbrix.com/mcp" } } }
+```
+
+On the first MCP handshake, Hebbrix creates an isolated free guest memory and
+keeps its credential in a Secure, HttpOnly session cookie. There is no signup,
+email, dashboard, local process, or API key to paste. A compatible MCP HTTP
+client automatically sends that cookie on later requests. Add your own bearer
+key at any time if you want to use an existing Hebbrix account instead.
+
 ## Quick start (no account needed)
 
 Add this to your MCP client config. On first run with no API key, the server mints a **free agent account** automatically (no email, no dashboard, ~2-4 seconds via proof-of-work) and saves it to `~/.hebbrix/config.json`.
@@ -122,6 +136,9 @@ All optional. With nothing set, the server starts in agent mode.
 | `HEBBRIX_MCP_HOST` | `127.0.0.1` | Bind host (HTTP transports) |
 | `HEBBRIX_MCP_PORT` | `8080` | Bind port (HTTP transports) |
 | `HEBBRIX_MCP_MULTI_TENANT` | off | Hosted mode: per-request `Authorization` header auth |
+| `HEBBRIX_MCP_ACCOUNTLESS` | off | Hosted mode: mint a bounded guest identity on unauthenticated `initialize` |
+| `HEBBRIX_MCP_SESSION_SECRET` | *(required for accountless)* | HMAC secret for stateless Secure guest cookies |
+| `HEBBRIX_MCP_INTERNAL_SECRET` | *(required for accountless)* | HMAC trust bridge for original-client signup throttling |
 
 ## Available Tools
 
@@ -161,6 +178,8 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_log_decision` - Record a decision and its outcome; feeds future confidence. Right after a `hebbrix_confidence` check you can log just the `outcome` — the description auto-fills from what you asked.
 - `hebbrix_list_collections` - List the memory spaces this key can use.
 - `hebbrix_account_status` - Tier, usage, limits, and expiry.
+- `hebbrix_claim_start` / `hebbrix_claim_verify` - Optionally keep an accountless
+  guest memory permanently, without changing its collection or losing data.
 
 The server also exposes a `hebbrix://profile` resource and a `context` prompt that inject the user's compiled profile.
 
@@ -191,7 +210,18 @@ HEBBRIX_API_KEY=mem_sk_... uvx hebbrix-mcp --transport streamable-http
 # serves http://127.0.0.1:8080/mcp
 ```
 
-**Hosted — nothing to run.** Point any HTTP-capable MCP client at the official hosted endpoint and authenticate with your own key (get one at [hebbrix.com/dashboard/api-keys](https://www.hebbrix.com/dashboard/api-keys)):
+**Hosted — nothing to run and no account required.** Point any HTTP-capable MCP
+client at the official hosted endpoint. The first handshake creates an isolated
+guest memory and a Secure, HttpOnly session cookie automatically:
+
+```json
+{ "mcpServers": { "hebbrix": {
+  "url": "https://mcp.hebbrix.com/mcp"
+}}}
+```
+
+To use an existing Hebbrix account instead, add its API key (get one at
+[hebbrix.com/dashboard/api-keys](https://www.hebbrix.com/dashboard/api-keys)):
 
 ```json
 { "mcpServers": { "hebbrix": {
@@ -200,7 +230,9 @@ HEBBRIX_API_KEY=mem_sk_... uvx hebbrix-mcp --transport streamable-http
 }}}
 ```
 
-**Self-hosted multi-tenant — one instance, many users.** Same shape on your own infra. The server holds no key; every request authenticates with its own `Authorization` header:
+**Self-hosted multi-tenant — one instance, many users.** Same shape on your own
+infra. By default every request authenticates with its own `Authorization`
+header:
 
 ```bash
 HEBBRIX_MCP_MULTI_TENANT=1 HEBBRIX_MCP_HOST=0.0.0.0 uvx hebbrix-mcp --transport streamable-http
@@ -212,7 +244,8 @@ Or run the container (multi-tenant by default, `GET /healthz` for load-balancer 
 docker build -t hebbrix-mcp . && docker run -p 8080:8080 hebbrix-mcp
 ```
 
-In multi-tenant mode there is no default collection — pass `collection_id` on tool calls.
+In multi-tenant mode, the server resolves each authenticated key's default
+collection automatically. An explicit `collection_id` still overrides it.
 
 ## How it works
 
@@ -223,7 +256,11 @@ In multi-tenant mode there is no default collection — pass `collection_id` on 
 └──────────────────┘                          └─────────────┘              └──────────┘
 ```
 
-This package owns **zero state**. Tool calls become REST calls against your Hebbrix account; memories, embeddings, the knowledge graph, and retrieval all live in the Hebbrix backend. Delete this package and your memories are still there.
+This package owns **no durable memory state**. Tool calls become REST calls
+against your Hebbrix tenant; memories, embeddings, the knowledge graph, and
+retrieval all live in the Hebbrix backend. The hosted accountless path keeps only
+a signed identity cookie in the MCP client so multiple stateless replicas can
+serve it. Delete the local package and your backend memories are still there.
 
 Agent-mode accounts never break mid-task: when a limit is reached you get a structured error with a `resolve` field, not a failure. Writes stop before reads; reads keep working; the account goes read-only before it expires.
 

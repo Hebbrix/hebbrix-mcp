@@ -62,12 +62,20 @@ def reset_usage():
     S._RECENT_WRITES.clear()  # process-global session caches — isolate each test
     S._RECENT_DELETES.clear()
     S._RECENT_CONFIDENCE.clear()
+    S._AUTH_COLLECTION_CACHE.clear()
+    S._REQUEST_KEY.set("")
+    S._REQUEST_COLLECTION.set("")
+    S._REQUEST_HOSTED.set(False)
     yield
     S._LAST_USAGE.set(None)
     S._LAST_USAGE_SIG = None
     S._RECENT_WRITES.clear()
     S._RECENT_DELETES.clear()
     S._RECENT_CONFIDENCE.clear()
+    S._AUTH_COLLECTION_CACHE.clear()
+    S._REQUEST_KEY.set("")
+    S._REQUEST_COLLECTION.set("")
+    S._REQUEST_HOSTED.set(False)
 
 
 def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
@@ -80,7 +88,7 @@ def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 20
+        assert len(tools) == 22
         names = {t.name for t in tools}
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
                          "hebbrix_update", "hebbrix_forget", "hebbrix_list",
@@ -90,7 +98,8 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_log_decision", "hebbrix_list_collections",
                          "hebbrix_account_status", "hebbrix_export",
                          "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used",
-                         "hebbrix_import"):
+                         "hebbrix_import", "hebbrix_claim_start",
+                         "hebbrix_claim_verify"):
             assert expected in names
         resources = await S.mcp.list_resources()
         assert [str(r.uri) for r in resources] == ["hebbrix://profile"]
@@ -106,6 +115,61 @@ def test_remember_returns_id_and_status(monkeypatch):
                                           "importance": 0.5}))
     out = asyncio.run(S.hebbrix_remember("fact", collection_id="c1"))
     assert out["id"] == "m1" and out["status"] == "pending"
+
+
+def test_smart_remember_wait_true_selects_sync_contract(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"results": [
+        {"id": "m1", "memory": "User likes tea", "event": "ADD"}
+    ]}))
+    out = asyncio.run(S.hebbrix_remember(
+        "I like tea", collection_id="c1", extract=True, wait_for_index=True
+    ))
+    sent = client.calls[-1][2]["json"]
+    assert sent["async_dispatch"] is False
+    assert sent["wait_for_index"] is True
+    assert out["id"] == "m1" and out["searchable"] is True
+
+
+def test_smart_remember_async_response_is_truthful(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(202, {
+        "job_id": "j1", "status": "queued", "poll_url": "/v1/memories/jobs/j1"
+    }))
+    out = asyncio.run(S.hebbrix_remember(
+        "I like tea", collection_id="c1", extract=True, wait_for_index=False
+    ))
+    assert client.calls[-1][2]["json"]["async_dispatch"] is True
+    assert out == {
+        "job_id": "j1", "status": "queued",
+        "poll_url": "/v1/memories/jobs/j1", "searchable": False,
+        "graph_enrichment": "queued",
+    }
+
+
+def test_remember_many_scopes_batch_at_top_level(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(201, {
+        "created": 2, "memory_ids": ["m1", "m2"]
+    }))
+    asyncio.run(S.hebbrix_remember_many(["one", "two"], collection_id="c1"))
+    sent = client.calls[-1][2]["json"]
+    assert sent["collection_id"] == "c1"
+    assert {item["collection_id"] for item in sent["memories"]} == {"c1"}
+
+
+def test_claim_start_and_verify_use_current_identity(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {"message": "sent"}))
+    assert asyncio.run(S.hebbrix_claim_start("person@example.com"))["message"] == "sent"
+    assert client.calls[-1][1].endswith("/agent-signup/claim")
+    assert client.calls[-1][2]["json"] == {"email": "person@example.com"}
+
+    client = _fake(monkeypatch, FakeResponse(200, {"claimed": True}))
+    assert asyncio.run(S.hebbrix_claim_verify("123456"))["claimed"] is True
+    assert client.calls[-1][1].endswith("/agent-signup/claim/verify")
+    assert client.calls[-1][2]["json"] == {"code": "123456"}
+
+
+def test_claim_inputs_fail_closed_before_network():
+    assert "error" in asyncio.run(S.hebbrix_claim_start("not-an-email"))
+    assert "error" in asyncio.run(S.hebbrix_claim_verify("12ab"))
 
 
 def test_remember_requires_collection(monkeypatch):
@@ -793,21 +857,23 @@ def test_log_decision_explicit_description_not_overwritten(monkeypatch):
 
 
 # ----------------------------------------------- hosted health-probe bypass
-def _run_mw(method, path, headers=None):
+def _run_mw(method, path, headers=None, body=b"", inner=None):
     sent = []
 
-    async def inner(scope, receive, send):
+    async def default_inner(scope, receive, send):
         # Record that the inner MCP app was reached (should NOT happen for a
         # health probe or an unauthenticated request).
         sent.append({"type": "INNER_APP_CALLED"})
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
 
     async def receive():
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": body, "more_body": False}
 
     async def send(msg):
         sent.append(msg)
 
-    mw = S._HeaderAuthMiddleware(inner)
+    mw = S._HeaderAuthMiddleware(inner or default_inner)
     scope = {"type": "http", "method": method, "path": path,
              "headers": [(k.encode(), v.encode()) for k, v in (headers or {}).items()]}
     asyncio.run(mw(scope, receive, send))
@@ -821,16 +887,124 @@ def test_health_probe_returns_200_without_auth():
     assert not any(m.get("type") == "INNER_APP_CALLED" for m in sent)
 
 
-def test_missing_bearer_still_401():
+def test_head_health_probe_returns_200_without_auth_and_no_body():
+    sent = _run_mw("HEAD", "/healthz")
+    start = next(m for m in sent if m.get("type") == "http.response.start")
+    response = next(m for m in sent if m.get("type") == "http.response.body")
+    assert start["status"] == 200 and response["body"] == b""
+    names = {k.decode().lower() for k, _ in start["headers"]}
+    assert "strict-transport-security" in names
+
+
+def test_missing_bearer_still_401(monkeypatch):
+    monkeypatch.setattr(S, "ACCOUNTLESS_HOSTED", False)
     sent = _run_mw("POST", "/mcp")
     start = next(m for m in sent if m.get("type") == "http.response.start")
     assert start["status"] == 401
     assert not any(m.get("type") == "INNER_APP_CALLED" for m in sent)
 
 
-def test_valid_bearer_reaches_inner_app():
+def test_valid_bearer_reaches_inner_app(monkeypatch):
+    async def resolve(_token):
+        return "c-default", None
+
+    monkeypatch.setattr(S, "_default_collection_for_token", resolve)
     sent = _run_mw("POST", "/mcp", headers={"authorization": "Bearer mem_sk_x"})
     assert any(m.get("type") == "INNER_APP_CALLED" for m in sent)
+
+
+def test_invalid_bearer_is_rejected_before_initialize(monkeypatch):
+    async def reject(_token):
+        return None, {"error": "invalid", "status": 401}
+
+    monkeypatch.setattr(S, "_default_collection_for_token", reject)
+    sent = _run_mw("POST", "/mcp", headers={"authorization": "Bearer bad"})
+    start = next(m for m in sent if m.get("type") == "http.response.start")
+    assert start["status"] == 401
+    assert not any(m.get("type") == "INNER_APP_CALLED" for m in sent)
+
+
+def test_accountless_initialize_mints_cookie_and_session_collection(monkeypatch):
+    monkeypatch.setattr(S, "ACCOUNTLESS_HOSTED", True)
+    monkeypatch.setattr(S, "SESSION_SECRET", "s" * 48)
+    monkeypatch.setattr(S, "INTERNAL_SECRET", "i" * 48)
+
+    async def mint(_ip, caller):
+        assert caller == "test-agent"
+        return {"api_key": "mem_sk_guest", "collection_id": "guest-c"}
+
+    observed = {}
+
+    async def inner(scope, receive, send):
+        observed["key"] = S._REQUEST_KEY.get()
+        observed["collection"] = S._cid(None)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    monkeypatch.setattr(S, "_mint_hosted_guest", mint)
+    body = json.dumps({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {"clientInfo": {"name": "test-agent", "version": "1"}},
+    }).encode()
+    sent = _run_mw("POST", "/mcp", headers={"x-forwarded-for": "203.0.113.8"},
+                   body=body, inner=inner)
+    start = next(m for m in sent if m.get("type") == "http.response.start")
+    response_headers = {k.decode().lower(): v.decode() for k, v in start["headers"]}
+    assert observed == {"key": "mem_sk_guest", "collection": "guest-c"}
+    assert response_headers["set-cookie"].startswith(f"{S.SESSION_COOKIE}=")
+    assert "Secure" in response_headers["set-cookie"]
+    assert "HttpOnly" in response_headers["set-cookie"]
+
+
+def test_accountless_cookie_reconnects_without_remint(monkeypatch):
+    monkeypatch.setattr(S, "ACCOUNTLESS_HOSTED", True)
+    monkeypatch.setattr(S, "SESSION_SECRET", "s" * 48)
+    cookie = S._session_cookie_value(
+        "mem_sk_guest", "guest-c", int(__import__("time").time()) + 3600
+    )
+
+    async def must_not_mint(*_args):
+        raise AssertionError("valid session must not mint a new tenant")
+
+    observed = {}
+
+    async def inner(scope, receive, send):
+        observed["key"] = S._REQUEST_KEY.get()
+        observed["collection"] = S._cid(None)
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"ok"})
+
+    monkeypatch.setattr(S, "_mint_hosted_guest", must_not_mint)
+    sent = _run_mw("POST", "/mcp", headers={
+        "cookie": f"{S.SESSION_COOKIE}={cookie}"
+    }, body=b'{"jsonrpc":"2.0","method":"tools/list"}', inner=inner)
+    assert observed == {"key": "mem_sk_guest", "collection": "guest-c"}
+    start = next(m for m in sent if m.get("type") == "http.response.start")
+    assert start["status"] == 200
+    assert any(k.lower() == b"set-cookie" for k, _ in start["headers"])
+
+
+def test_invalid_guest_cookie_is_rejected_without_identity_reset(monkeypatch):
+    monkeypatch.setattr(S, "ACCOUNTLESS_HOSTED", True)
+    monkeypatch.setattr(S, "SESSION_SECRET", "s" * 48)
+    body = b'{"jsonrpc":"2.0","id":1,"method":"initialize"}'
+    sent = _run_mw("POST", "/mcp", headers={
+        "cookie": f"{S.SESSION_COOKIE}=tampered"
+    }, body=body)
+    assert next(m for m in sent if m.get("type") == "http.response.start")["status"] == 401
+    assert not any(m.get("type") == "INNER_APP_CALLED" for m in sent)
+
+
+def test_hosted_validation_failure_raises_real_tool_error(monkeypatch):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    monkeypatch.setattr(S, "DEFAULT_COLLECTION", "")
+    token = S._REQUEST_HOSTED.set(True)
+    try:
+        with pytest.raises(ToolError):
+            asyncio.run(S.hebbrix_search("q"))
+    finally:
+        S._REQUEST_HOSTED.reset(token)
 
 
 # ============================================================================
