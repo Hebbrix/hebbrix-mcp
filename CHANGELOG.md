@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.0 — 2026-08-10
+
+- Added the tenant-isolated Outcome Memory loop: `hebbrix_choose_action`,
+  `hebbrix_report_outcome`, and `hebbrix_learning_insights`.
+- Agents can now record a decision before acting, report delayed or corrected
+  real-world results, and learn a conservative per-customer/context policy.
+- External choices require their real behavior propensity; exploration is
+  opt-in and capped at 20%; missing outcomes are censored rather than treated as
+  failure.
+
 ## 0.4.0 — 2026-08-10
 
 Hosted accountless MCP and contract hardening.

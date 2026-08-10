@@ -14,6 +14,8 @@ Your agent forgets everything when the session ends. This fixes that, and goes f
 - **Memory** — store, search, correct, and version facts across sessions
 - **Knowledge graph** — entities, relationships, timelines, and "what was true at time X"
 - **Reasoning** — ask how confident the agent should be before acting, and log outcomes so it improves
+- **Outcome Memory** — learn which action works for each customer and context
+  from delayed results, with safe baselines and inspectable uncertainty
 
 Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other MCP client.
 
@@ -176,6 +178,15 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_ask` - **One-call GraphRAG.** Ask a natural-language question; it searches memory, synthesizes an answer with an LLM, cites the memory ids it used, and enriches with knowledge-graph relationships + your profile. Use instead of orchestrating search + graph + profile yourself.
 - `hebbrix_confidence` - How confident should the agent be before acting? Grounded in memory + past outcomes.
 - `hebbrix_log_decision` - Record a decision and its outcome; feeds future confidence. Right after a `hebbrix_confidence` check you can log just the `outcome` — the description auto-fills from what you asked.
+- `hebbrix_choose_action` - Safely choose among repeatable strategies and create
+  a causal decision receipt before acting. Supports per-user/context policies and
+  explicitly bounded exploration.
+- `hebbrix_report_outcome` - Close that decision loop later with `success`, a
+  bounded reward, or configured business metrics. Corrections replace prior
+  evidence instead of double-counting it.
+- `hebbrix_learning_insights` - Inspect posterior probabilities, credible
+  intervals, effective evidence, and optional chronological-holdout policy
+  readiness checks for one customer policy.
 - `hebbrix_list_collections` - List the memory spaces this key can use.
 - `hebbrix_account_status` - Tier, usage, limits, and expiry.
 - `hebbrix_claim_start` / `hebbrix_claim_verify` - Optionally keep an accountless

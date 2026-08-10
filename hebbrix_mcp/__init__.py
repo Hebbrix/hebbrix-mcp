@@ -1,11 +1,12 @@
 """Hebbrix MCP server — memory + knowledge graph tools for any MCP-compatible agent.
 
-Tool surface (15 tools + a profile resource + a context prompt):
+Tool surface (25 tools + a profile resource + a context prompt):
   Memory:  hebbrix_remember, hebbrix_search, hebbrix_get, hebbrix_update,
            hebbrix_forget, hebbrix_list, hebbrix_history
   Graph:   hebbrix_search_entities, hebbrix_entity_timeline,
            hebbrix_graph_query, hebbrix_contradictions
-  Reason:  hebbrix_confidence, hebbrix_log_decision
+  Reason:  hebbrix_confidence, hebbrix_log_decision, hebbrix_choose_action,
+           hebbrix_report_outcome, hebbrix_learning_insights
   Account: hebbrix_list_collections, hebbrix_account_status
 
 Transports: stdio (default) and streamable-http (--transport streamable-http).
@@ -26,5 +27,5 @@ Configure with env vars:
 """
 from .server import mcp, run
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 __all__ = ["__version__", "mcp", "run"]

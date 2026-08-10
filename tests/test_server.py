@@ -111,7 +111,7 @@ def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 22
+        assert len(tools) == 25
         names = {t.name for t in tools}
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
                          "hebbrix_update", "hebbrix_forget", "hebbrix_list",
@@ -123,6 +123,9 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used",
                          "hebbrix_import", "hebbrix_claim_start",
                          "hebbrix_claim_verify"):
+            assert expected in names
+        for expected in ("hebbrix_choose_action", "hebbrix_report_outcome",
+                         "hebbrix_learning_insights"):
             assert expected in names
         resources = await S.mcp.list_resources()
         assert [str(r.uri) for r in resources] == ["hebbrix://profile"]
@@ -193,6 +196,102 @@ def test_claim_start_and_verify_use_current_identity(monkeypatch):
 def test_claim_inputs_fail_closed_before_network():
     assert "error" in asyncio.run(S.hebbrix_claim_start("not-an-email"))
     assert "error" in asyncio.run(S.hebbrix_claim_verify("12ab"))
+
+
+def test_outcome_memory_choice_report_and_insights(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(201, {
+        "decision_id": "d1", "policy_key": "support.reply",
+        "chosen_action_key": "concise", "recommended_action_key": "concise",
+        "baseline_action_key": "concise", "action_probability": 1.0,
+        "used_baseline": True, "reason": "insufficient_challenger_evidence",
+        "policy_version": "outcome-memory-v1.2", "replayed": False,
+    }))
+    choice = asyncio.run(S.hebbrix_choose_action(
+        "support.reply", ["concise", "detailed"],
+        context={"channel": "support"}, collection_id="c1",
+        idempotency_key="request-1",
+    ))
+    assert choice["decision_id"] == "d1"
+    assert choice["chosen_action_key"] == "concise"
+    sent = client.calls[-1][2]["json"]
+    assert sent["mode"] == "recommend"
+    assert sent["baseline_action_key"] == "concise"
+    assert sent["candidates"] == [
+        {"action_key": "concise"}, {"action_key": "detailed"}
+    ]
+
+    client = _fake(monkeypatch, FakeResponse(200, {
+        "decision_id": "d1", "status": "complete", "composite_reward": 1.0,
+        "reward_confidence": 1.0, "outcome_count": 1,
+        "evidence_revision": 1, "replayed": False,
+    }))
+    result = asyncio.run(S.hebbrix_report_outcome(
+        "d1", success=True, idempotency_key="result-1"
+    ))
+    assert result["learned"] is True
+    assert client.calls[-1][1].endswith("/learning/decisions/d1/outcomes")
+    sent = client.calls[-1][2]["json"]
+    assert "success" not in sent
+    assert sent["observations"] == [{
+        "metric_key": "success", "value": 1.0, "confidence": 1.0,
+        "source": "explicit", "is_final": True,
+        "idempotency_key": "result-1:metric:0",
+    }]
+
+    client = _fake(monkeypatch, FakeResponse(200, {
+        "policy_key": "support.reply", "policy_version": "outcome-memory-v1",
+        "tenant_isolated": True,
+        "actions": [{"action_key": "concise", "effective_evidence": 4}],
+    }))
+    insights = asyncio.run(S.hebbrix_learning_insights(
+        "support.reply", actions=["concise"], context={"channel": "support"},
+        collection_id="c1",
+    ))
+    assert insights["tenant_isolated"] is True
+    params = client.calls[-1][2]["params"]
+    assert params["action_key"] == ["concise"]
+    assert json.loads(params["context"]) == {"channel": "support"}
+
+
+def test_outcome_memory_rejects_unknown_propensity_and_unsafe_exploration():
+    out = asyncio.run(S.hebbrix_choose_action(
+        "support.reply", ["a", "b"], chosen_action="a"
+    ))
+    assert "action_probability is required" in out["error"]
+    out = asyncio.run(S.hebbrix_choose_action(
+        "support.reply", ["a", "b"], exploration_rate=0.3
+    ))
+    assert "between 0 and 0.2" in out["error"]
+    out = asyncio.run(S.hebbrix_report_outcome("d1"))
+    assert "success, reward" in out["error"]
+    out = asyncio.run(S.hebbrix_choose_action("support.reply", ["not an action"]))
+    assert "machine keys" in out["error"]
+
+
+def test_outcome_memory_preserves_provisional_and_correction_semantics(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {
+        "decision_id": "d1", "status": "observed", "composite_reward": 0.4,
+        "reward_confidence": 0.3, "outcome_count": 2,
+        "evidence_revision": 2, "replayed": False,
+    }))
+    asyncio.run(S.hebbrix_report_outcome(
+        "d1", reward=0.4, metrics={"revenue": 19.5}, confidence=0.3,
+        final=False, correction=True, idempotency_key="fix-1",
+    ))
+    sent = client.calls[-1][2]["json"]
+    assert "reward" not in sent
+    assert "success" not in sent
+    assert [item["metric_key"] for item in sent["observations"]] == [
+        "reward", "revenue"
+    ]
+    assert all(item["source"] == "correction" for item in sent["observations"])
+    assert all(item["is_final"] is False for item in sent["observations"])
+    assert all(item["confidence"] == 0.3 for item in sent["observations"])
+
+
+def test_outcome_memory_rejects_non_finite_metrics():
+    out = asyncio.run(S.hebbrix_report_outcome("d1", metrics={"quality": float("nan")}))
+    assert "finite number" in out["error"]
 
 
 def test_remember_requires_collection(monkeypatch):
