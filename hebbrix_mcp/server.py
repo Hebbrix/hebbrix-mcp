@@ -1712,8 +1712,11 @@ async def _mint_hosted_guest(client_ip: str, caller: str) -> dict[str, Any]:
             json={"agent_caller": (caller or "hosted-mcp")[:64]},
             headers=_hosted_ip_headers(client_ip),
         )
-    except Exception as exc:
-        return {"error": f"accountless onboarding is temporarily unavailable: {exc}",
+    except Exception:
+        # Network and client exceptions can contain upstream URLs, hostnames,
+        # and connection details. Keep those in server logs; callers only need
+        # a stable, actionable availability error.
+        return {"error": "accountless onboarding is temporarily unavailable",
                 "status": 503}
     if response.status_code != 201:
         detail = response.text[:500] if response.text else "signup rejected"
@@ -1915,9 +1918,22 @@ class _HeaderAuthMiddleware:
 
             async def secure_send(message):
                 if message.get("type") == "http.response.start":
-                    response_headers = list(message.get("headers") or [])
+                    # FastMCP's streaming transport supplies `no-cache`, but a
+                    # hosted response may also carry a freshly minted bearer
+                    # session. Replace (rather than duplicate) Cache-Control so
+                    # intermediaries are unambiguously forbidden to store it.
+                    response_headers = [
+                        (key, value)
+                        for key, value in (message.get("headers") or [])
+                        if key.lower() != b"cache-control"
+                    ]
                     present = {k.lower() for k, _ in response_headers}
                     response_headers.extend((k, v) for k, v in _SECURITY_HEADERS if k not in present)
+                    response_headers = [
+                        (key, b"no-store, no-cache, no-transform")
+                        if key.lower() == b"cache-control" else (key, value)
+                        for key, value in response_headers
+                    ]
                     if set_cookie:
                         response_headers.append((b"set-cookie", set_cookie.encode()))
                     message = {**message, "headers": response_headers}

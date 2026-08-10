@@ -954,6 +954,7 @@ def test_accountless_initialize_mints_cookie_and_session_collection(monkeypatch)
     assert response_headers["set-cookie"].startswith(f"{S.SESSION_COOKIE}=")
     assert "Secure" in response_headers["set-cookie"]
     assert "HttpOnly" in response_headers["set-cookie"]
+    assert response_headers["cache-control"] == "no-store, no-cache, no-transform"
 
 
 def test_accountless_cookie_reconnects_without_remint(monkeypatch):
