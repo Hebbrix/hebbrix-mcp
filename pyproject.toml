@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hebbrix-mcp"
-version = "0.5.0"
+version = "0.5.1"
 description = "Hebbrix MCP server — long-term memory and knowledge graph for any MCP-compatible agent (Claude Desktop, Cline, Cursor, etc.)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -74,3 +74,8 @@ include = [
     "/LICENSE",
     "/quick_setup.sh",
 ]
+
+[tool.ruff.lint]
+# Keep CI's long-standing correctness-focused baseline stable across Ruff
+# releases; new Ruff versions must not silently enable every style/plugin rule.
+select = ["E4", "E7", "E9", "F"]

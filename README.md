@@ -151,8 +151,10 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_remember` - Store a fact, decision, or preference.
     - `content` (string, required): the memory text
     - `tags` (list, optional), `collection_id` (string, optional)
-    - `extract` (bool, default false): false stores the text exactly (one memory); true runs fact-extraction and may create several atomic memories
+    - `extract` (bool, default false): false stores the text exactly (one memory); true starts a tracked fact-extraction job and may create several atomic memories
+    - `wait_for_extraction` (bool, default true): for smart ingestion, poll for up to 20 seconds and return normalized atomic memories. Set false for immediate acknowledgement, then call `hebbrix_extraction_status` with the returned job id.
     - `wait_for_index` (bool, default true): guarantees **memory-search** availability — `hebbrix_search` returns the fact the moment the call returns. It does **not** cover knowledge-graph enrichment (entities/timelines/graph), which lands asynchronously (~30s); the response's `graph_enrichment: "processing"` flags this.
+- `hebbrix_extraction_status` - Poll a smart-ingestion job until its created/updated memories or terminal error are available.
 - `hebbrix_remember_many` - Store **many** facts in one call (one round-trip, one rate-limit hit). Pass `facts` (list of strings). Falls back to sequential writes on free/agent tiers.
 - `hebbrix_search` - Semantic search (hybrid vector + BM25 + graph retrieval).
     - `query` (string, required), `limit` (int, optional), `collection_id` (string, optional)

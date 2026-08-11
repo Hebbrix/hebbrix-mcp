@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.1 — 2026-08-10
+
+- Made smart ingestion explicitly asynchronous and reliable: `extract=true`
+  starts a tracked job, polls it by default, and returns normalized atomic
+  memories instead of leaking backend job envelopes.
+- Added `hebbrix_extraction_status` and `wait_for_extraction=false` for agents
+  that need immediate acknowledgement without losing completion visibility.
+- Normalized FastAPI, gateway, and nested provider errors; stabilized
+  `hebbrix_forget` responses for successful and already-absent deletes.
+- Bounded accountless local startup to 28 seconds while preserving hosted guest
+  sessions, tenant isolation, pooled upstream connections, and Outcome Memory.
+
 ## 0.5.0 — 2026-08-10
 
 - Added the tenant-isolated Outcome Memory loop: `hebbrix_choose_action`,

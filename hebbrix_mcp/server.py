@@ -28,6 +28,7 @@ plugin's SessionStart hook).
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import hmac
@@ -43,7 +44,7 @@ from contextvars import ContextVar
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 import httpx
 from mcp.server.fastmcp import FastMCP
@@ -61,6 +62,14 @@ KEY = os.environ.get("HEBBRIX_API_KEY", "")
 DEFAULT_COLLECTION = os.environ.get("HEBBRIX_COLLECTION_ID", "")
 HOST = os.environ.get("HEBBRIX_MCP_HOST", "127.0.0.1")
 PORT = int(os.environ.get("HEBBRIX_MCP_PORT", "8080"))
+try:
+    EXTRACTION_POLL_SECONDS = max(
+        0.0,
+        min(float(os.environ.get("HEBBRIX_EXTRACTION_POLL_SECONDS", "20")), 25.0),
+    )
+except (TypeError, ValueError):
+    EXTRACTION_POLL_SECONDS = 20.0
+AUTO_PROVISION_DEADLINE_SECONDS = 28.0
 # Hosted mode: authenticate every request from its own bearer header, never the
 # server's key. `_API_BASE_FROM_ENV` lets a saved api_base be honored on reload
 # while an explicit env var still wins.
@@ -364,32 +373,40 @@ def _auto_provision() -> bool:
     carries a `hebbrix_usage` block telling the agent when/how to suggest claiming.
     """
     global KEY, DEFAULT_COLLECTION
+    started_at = time.monotonic()
+
+    def _remaining() -> float:
+        return max(0.1, AUTO_PROVISION_DEADLINE_SECONDS - (time.monotonic() - started_at))
     caller = "claude-code" if os.environ.get("CLAUDECODE") else (
         "cursor" if os.environ.get("CURSOR_TRACE_ID") else "unknown")
     body: dict[str, Any] = {"agent_caller": caller}
     # Proof-of-work (best effort): get a challenge, solve it, attach the nonce.
     try:
-        ch = httpx.post(f"{BASE}/agent-signup/challenge", timeout=15.0)
+        ch = httpx.post(
+            f"{BASE}/agent-signup/challenge", timeout=min(5.0, _remaining())
+        )
         if ch.status_code == 200:
             cj = ch.json()
-            nonce = _solve_pow(cj["challenge"], int(cj["difficulty_bits"]))
+            nonce = _solve_pow(
+                cj["challenge"],
+                int(cj["difficulty_bits"]),
+                max_seconds=min(12.0, _remaining()),
+            )
             if nonce is not None:
                 body["challenge"] = cj["challenge"]
                 body["nonce"] = nonce
     except Exception:
         pass  # old backend / no challenge endpoint -> plain mint under IP caps
     try:
-        r = httpx.post(f"{BASE}/agent-signup", json=body, timeout=20.0)
+        r = httpx.post(
+            f"{BASE}/agent-signup", json=body, timeout=min(10.0, _remaining())
+        )
     except Exception as e:
         print(f"hebbrix-mcp: auto-signup failed ({e}). Set HEBBRIX_API_KEY instead.",
               file=sys.stderr)
         return False
     if r.status_code != 201:
-        code = None
-        try:
-            code = (r.json().get("detail") or {}).get("code")
-        except Exception:
-            pass
+        code, _message = _api_error_fields(r)
         if code in ("MINT_IP_LIMIT", "MINT_SUBNET_LIMIT", "AGENT_SIGNUP_AT_CAPACITY"):
             print(
                 "hebbrix-mcp: free no-account signup is rate-limited from your network "
@@ -487,6 +504,44 @@ def _fail(message: str, status: Optional[int] = None, **extra: Any) -> dict[str,
     return out
 
 
+def _api_error_fields(r: httpx.Response) -> tuple[Optional[str], Optional[str]]:
+    """Read FastAPI, legacy gateway, and nested provider error envelopes."""
+
+    try:
+        payload: Any = r.json()
+    except Exception:
+        payload = None
+
+    code: Optional[str] = None
+    message: Optional[str] = None
+    pending: list[Any] = [payload]
+    visited: set[int] = set()
+    while pending:
+        node = pending.pop(0)
+        if id(node) in visited:
+            continue
+        visited.add(id(node))
+        if isinstance(node, str):
+            message = message or node.strip() or None
+            continue
+        if not isinstance(node, dict):
+            continue
+        raw_code = node.get("code") or node.get("error_code")
+        if raw_code is not None and code is None:
+            code = str(raw_code)
+        raw_message = node.get("message")
+        if isinstance(raw_message, str) and raw_message.strip() and message is None:
+            message = raw_message.strip()
+        for key in ("detail", "error", "message"):
+            nested = node.get(key)
+            if isinstance(nested, (dict, str)):
+                pending.append(nested)
+    if message is None:
+        raw = (getattr(r, "text", "") or "").strip()
+        message = raw[:800] or None
+    return code, message
+
+
 def _err(r: httpx.Response) -> dict[str, Any]:
     body = r.text or ""
     # A WAF / proxy in front of the API can reject a request with a raw HTML 403
@@ -502,11 +557,20 @@ def _err(r: httpx.Response) -> dict[str, Any]:
                          "path (e.g. <script>, onerror=, ../). The write did NOT "
                          "succeed and was not stored. Rephrase or escape such content "
                          "and retry.",
-                "status": 403, "waf_blocked": True}
+                "status": 403, "ok": False, "waf_blocked": True}
     # Keep enough of the body that the API's actionable guidance (e.g. "use X
     # instead") isn't chopped mid-sentence. `status` lets callers branch on the
     # HTTP code (e.g. degrade a tier-gated batch write to sequential on 403).
-    return {"error": f"HTTP {r.status_code}: {body[:800]}", "status": r.status_code}
+    code, message = _api_error_fields(r)
+    label = f"{code}: {message}" if code and message else (message or body[:800])
+    out: dict[str, Any] = {
+        "error": f"HTTP {r.status_code}: {label}",
+        "status": r.status_code,
+        "ok": False,
+    }
+    if code:
+        out["error_code"] = code
+    return out
 
 
 def _reasoning_quota_exhausted(r: Any) -> bool:
@@ -635,9 +699,116 @@ async def _patch(path: str, body: dict) -> Any:
 async def _delete(path: str) -> dict[str, Any]:
     r = await _client().delete(f"{BASE}{path}", headers=_auth_headers())
     _capture_usage(r)
-    return (_err(r) | {"ok": False}) if r.status_code >= 400 else {
-        "status": r.status_code, "ok": True
+    if r.status_code >= 400:
+        return _err(r)
+    return {"status": r.status_code, "ok": True}
+
+
+def _relative_api_path(poll_url: str, job_id: str) -> str:
+    """Convert an absolute or `/v1/...` poll URL to the path `_get` expects."""
+
+    raw = str(poll_url or "").strip()
+    if not raw:
+        return f"/memories/jobs/{quote(str(job_id), safe='')}"
+    parsed = urlparse(raw)
+    path = parsed.path if parsed.scheme or parsed.netloc else raw.split("?", 1)[0]
+    base_path = urlparse(BASE).path.rstrip("/")
+    if base_path and path.startswith(base_path + "/"):
+        path = path[len(base_path):]
+    if not path.startswith("/"):
+        path = "/" + path
+    return path
+
+
+def _shape_extraction_result(
+    payload: dict[str, Any],
+    *,
+    job_id: Optional[str] = None,
+    poll_url: Optional[str] = None,
+) -> dict[str, Any]:
+    """Normalize synchronous and polled extraction payloads for MCP callers."""
+
+    result = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+    items = result.get("results") or result.get("events") or []
+    memories = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        memories.append(
+            {
+                "id": item.get("id") or item.get("memory_id"),
+                "content": item.get("memory") or item.get("content"),
+                "event": item.get("event"),
+            }
+        )
+    status = str(
+        payload.get("status") or result.get("processing_status") or "completed"
+    ).casefold()
+    graph_enrichment = {
+        "completed": "processing",
+        "failed": "failed",
+        "cancelled": "cancelled",
+        "canceled": "cancelled",
+    }.get(status, "pending")
+    out: dict[str, Any] = {
+        "id": result.get("id") or (memories[0].get("id") if memories else None),
+        "extracted": result.get("created_count", result.get("facts_extracted")),
+        "updated": result.get("updated_count", result.get("memories_updated")),
+        "memories": memories[:10],
+        "status": status,
+        "searchable": status == "completed",
+        "graph_enrichment": graph_enrichment,
     }
+    if job_id or payload.get("job_id"):
+        out["job_id"] = job_id or payload.get("job_id")
+    if poll_url:
+        out["poll_url"] = poll_url
+    error = payload.get("error") or result.get("error")
+    if error:
+        out["error"] = error
+    return out
+
+
+async def _memory_job_status(job_id: str, poll_url: Optional[str] = None) -> dict[str, Any]:
+    path = _relative_api_path(poll_url or "", job_id)
+    data = await _get(path)
+    if not isinstance(data, dict):
+        return {"error": "invalid extraction job response", "status": "failed"}
+    # Successful job envelopes include error=null. Only an HTTP/client error
+    # envelope is already normalized; actual jobs always pass through the shaper.
+    if data.get("ok") is False:
+        return data
+    return _shape_extraction_result(data, job_id=job_id, poll_url=poll_url or path)
+
+
+async def _wait_for_memory_job(
+    job_id: str,
+    poll_url: Optional[str],
+    timeout_seconds: float,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + max(0.0, timeout_seconds)
+    delay = 0.25
+    latest: dict[str, Any] = {
+        "job_id": job_id,
+        "poll_url": poll_url,
+        "status": "queued",
+    }
+    while time.monotonic() < deadline:
+        latest = await _memory_job_status(job_id, poll_url)
+        if latest.get("error") or latest.get("status") in {
+            "completed",
+            "failed",
+            "cancelled",
+            "canceled",
+        }:
+            return latest
+        await asyncio.sleep(min(delay, max(0.0, deadline - time.monotonic())))
+        delay = min(delay * 1.5, 1.0)
+    latest["status"] = str(latest.get("status") or "processing")
+    latest["next_action"] = (
+        f"Extraction is still running; call hebbrix_extraction_status with job_id {job_id}."
+    )
+    return latest
 
 
 def _mem_row(m: dict) -> dict[str, Any]:
@@ -725,6 +896,7 @@ async def hebbrix_remember(
     collection_id: Optional[str] = None,
     extract: bool = False,
     wait_for_index: bool = True,
+    wait_for_extraction: bool = True,
 ) -> dict[str, Any]:
     """Store a memory. Use this whenever the user shares a fact, decision, or
     preference worth recalling later — this is the agent's memory, prefer it over
@@ -732,7 +904,11 @@ async def hebbrix_remember(
 
     extract=False (default): stores the text exactly as given (fast, one memory).
     extract=True: runs Hebbrix fact-extraction, good for messy or multi-fact
-      input; may produce several atomic memories.
+      input; may produce several atomic memories. Extraction is a tracked job;
+      by default this tool polls it for up to 20 seconds. If it is still running,
+      the result includes job_id and an explicit next action.
+    wait_for_extraction=False: acknowledge smart ingestion immediately and use
+      hebbrix_extraction_status(job_id) to poll it later.
     wait_for_index=True (default): guarantees MEMORY SEARCH availability — the
       memory is returned by hebbrix_search the moment this call returns
       (read-after-write). Set False for fire-and-forget bulk writes.
@@ -758,44 +934,35 @@ async def hebbrix_remember(
             "content": content,
             "collection_id": cid,
             "infer": True,
+            "async_dispatch": True,
             "wait_for_index": wait_for_index,
-            # The production API defaults inference to async. A caller asking
-            # for read-after-write must explicitly select the synchronous
-            # contract; fire-and-forget gets a truthful 202/job response.
-            "async_dispatch": not wait_for_index,
         }
         if tags:
             body["tags"] = tags
         data = await _post("/memories", body)
         if "error" in data:
             return _u(data)
-        if data.get("job_id"):
-            return _u({
-                "job_id": data.get("job_id"),
-                "status": data.get("status", "accepted"),
-                "poll_url": data.get("poll_url"),
-                "searchable": False,
-                "graph_enrichment": "queued",
-            })
-        results = data.get("results") or []
-        # Cache each extracted memory so it's locally recallable this session.
-        for it in results:
-            _cache_put(it.get("id") or it.get("memory_id"), it.get("memory"), cid)
-        # /memories result items are {id, memory_id, event, memory, reason} —
-        # the extracted text is under "memory", not "content".
-        return _u({"id": data.get("id") or (results[0].get("id") or results[0].get("memory_id")
-                                             if results else None),
-                   "extracted": data.get("created_count"),
-                   "updated": data.get("updated_count"),
-                   "memories": [{"id": it.get("id") or it.get("memory_id"),
-                                 "content": it.get("memory"),
-                                 "event": it.get("event")}
-                                for it in results[:10]],
-                   "status": data.get("processing_status", "pending"),
-                   "searchable": wait_for_index,
-                   # Memory search is ready (per searchable); entity/graph
-                   # enrichment runs asynchronously and lands separately.
-                   "graph_enrichment": "processing"})
+        job_id = data.get("job_id")
+        poll_url = data.get("poll_url")
+        if job_id:
+            if wait_for_extraction:
+                out = await _wait_for_memory_job(
+                    str(job_id), poll_url, EXTRACTION_POLL_SECONDS
+                )
+            else:
+                out = _shape_extraction_result(
+                    data, job_id=str(job_id), poll_url=poll_url
+                )
+                out["next_action"] = (
+                    f"Call hebbrix_extraction_status with job_id {job_id}."
+                )
+        else:
+            # Rolling-deploy compatibility: older backends may still complete
+            # extraction synchronously and return results inline.
+            out = _shape_extraction_result(data)
+        for item in out.get("memories") or []:
+            _cache_put(item.get("id"), item.get("content"), cid)
+        return _u(out)
     # Default: exact/raw storage. wait_for_index makes it searchable on return.
     body = {"content": content, "collection_id": cid, "wait_for_index": wait_for_index}
     if tags:
@@ -810,6 +977,29 @@ async def hebbrix_remember(
                # runs asynchronously (typically ready within ~30s), separate from
                # wait_for_index.
                "graph_enrichment": "processing"})
+
+
+@mcp.tool()
+async def hebbrix_extraction_status(
+    job_id: str,
+    collection_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Poll a smart-ingestion job returned by hebbrix_remember(extract=True).
+
+    Returns queued/processing/indexing_pending until terminal, then returns the
+    created/updated atomic memories on completed or an actionable error on failed.
+    Jobs expire after the backend retention window, so poll promptly.
+    """
+
+    job_id = str(job_id or "").strip()
+    if not job_id or len(job_id) > 64:
+        return _fail("job_id must contain 1 to 64 characters")
+    out = await _memory_job_status(job_id)
+    cid = _cid(collection_id)
+    if out.get("status") == "completed":
+        for item in out.get("memories") or []:
+            _cache_put(item.get("id"), item.get("content"), cid)
+    return _u(out)
 
 
 @mcp.tool()
@@ -1004,7 +1194,13 @@ async def hebbrix_update(
 
 @mcp.tool()
 async def hebbrix_forget(memory_id: str) -> dict[str, Any]:
-    """Delete a memory by id."""
+    """Delete a memory by id.
+
+    A successful deletion returns ``deleted=true`` and the requested memory id;
+    an already-absent id retains the structured 404 error and adds
+    ``already_absent=true``. This stable tool shape does not depend on whether
+    the API's successful DELETE response has a JSON body.
+    """
     result = await _delete(f"/memories/{memory_id}")
     # On a confirmed delete (2xx) OR a remote 404 (already gone), tombstone the id
     # so it can't be resurrected this session by the local overlay or a stale
@@ -1012,6 +1208,16 @@ async def hebbrix_forget(memory_id: str) -> dict[str, Any]:
     status = result.get("status")
     if result.get("ok") or status == 404:
         _cache_delete(memory_id)
+    if result.get("ok"):
+        result.update({"deleted": True, "memory_id": str(memory_id)})
+    elif status == 404:
+        result.update(
+            {
+                "deleted": False,
+                "already_absent": True,
+                "memory_id": str(memory_id),
+            }
+        )
     return _u(result)
 
 
