@@ -11,6 +11,9 @@
   `hebbrix_forget` responses for successful and already-absent deletes.
 - Bounded accountless local startup to 28 seconds while preserving hosted guest
   sessions, tenant isolation, pooled upstream connections, and Outcome Memory.
+- Corrected the README's usage-envelope contract: local clients receive it on
+  first use, material threshold/status changes, and constrained states, while
+  hosted requests attach it per request and account status remains explicit.
 
 ## 0.5.0 — 2026-08-10
 

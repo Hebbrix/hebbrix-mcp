@@ -50,7 +50,7 @@ Add this to your MCP client config. On first run with no API key, the server min
 
 Restart the client. Done — your agent now has persistent memory.
 
-The free agent account includes **300 learning events** and **2,000 retrievals**, and expires 14 days after last use if unclaimed. Every tool result carries a `hebbrix_usage` block so the agent always knows where it stands and will tell you when it's time to claim.
+The free agent account includes **300 learning events** and **2,000 retrievals**, and expires 14 days after last use if unclaimed. The first tool result, material quota/status changes, and every constrained-state result carry a `hebbrix_usage` block; `hebbrix_account_status` returns it on demand at any time.
 
 **Keep it forever** (same key, all memories carry over, unlocks the free monthly tier):
 
