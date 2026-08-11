@@ -80,7 +80,7 @@ def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 20
+        assert len(tools) == 21
         names = {t.name for t in tools}
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
                          "hebbrix_update", "hebbrix_forget", "hebbrix_list",
@@ -92,6 +92,7 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used",
                          "hebbrix_import"):
             assert expected in names
+        assert "hebbrix_extraction_status" in names
         resources = await S.mcp.list_resources()
         assert [str(r.uri) for r in resources] == ["hebbrix://profile"]
         prompts = await S.mcp.list_prompts()
@@ -598,11 +599,112 @@ def test_remember_extract_routes_to_smart_endpoint(monkeypatch):
     _, url, kw = client.calls[-1]
     assert url.endswith("/memories") and not url.endswith("/memories/raw")
     assert kw["json"]["infer"] is True
+    assert kw["json"]["async_dispatch"] is True
     assert out["extracted"] == 2
     # content must come from the "memory" key, not "content" (was returning null)
     assert out["memories"][0]["content"] == "Sam is a designer."
     assert out["memories"][0]["event"] == "ADD"
     assert out["id"] == "m1"  # parent id null -> falls back to first result id
+
+
+def test_remember_extract_polls_job_to_actionable_memories(monkeypatch):
+    class JobClient(FakeClient):
+        def __init__(self):
+            super().__init__(FakeResponse())
+            self.polls = 0
+
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            return FakeResponse(202, {
+                "job_id": "job-1",
+                "status": "queued",
+                "poll_url": "/v1/memories/jobs/job-1",
+            })
+
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            self.polls += 1
+            if self.polls == 1:
+                return FakeResponse(200, {"job_id": "job-1", "status": "processing"})
+            return FakeResponse(200, {
+                "job_id": "job-1",
+                "status": "completed",
+                "result": {
+                    "facts_extracted": 2,
+                    "memories_created": 2,
+                    "memories_updated": 0,
+                    "events": [
+                        {"memory_id": "m1", "content": "Sam is a designer.", "event": "ADD"},
+                        {"memory_id": "m2", "content": "Sam lives in Oslo.", "event": "ADD"},
+                    ],
+                },
+            })
+
+    client = JobClient()
+    monkeypatch.setattr(S, "_client", lambda: client)
+    monkeypatch.setattr(S, "EXTRACTION_POLL_SECONDS", 2.0)
+
+    out = asyncio.run(S.hebbrix_remember(
+        "messy multi-fact text", collection_id="c1", extract=True
+    ))
+
+    assert out["job_id"] == "job-1"
+    assert out["status"] == "completed"
+    assert out["extracted"] == 2
+    assert [m["id"] for m in out["memories"]] == ["m1", "m2"]
+    assert client.calls[-1][1].endswith("/v1/memories/jobs/job-1")
+
+
+def test_remember_extract_can_return_immediately_with_poll_instruction(monkeypatch):
+    _fake(monkeypatch, FakeResponse(202, {
+        "job_id": "job-2",
+        "status": "queued",
+        "poll_url": "/v1/memories/jobs/job-2",
+    }))
+
+    out = asyncio.run(S.hebbrix_remember(
+        "messy", collection_id="c1", extract=True, wait_for_extraction=False
+    ))
+
+    assert out["job_id"] == "job-2"
+    assert out["status"] == "queued"
+    assert "hebbrix_extraction_status" in out["next_action"]
+
+
+def test_extraction_status_normalizes_completed_job(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {
+        "job_id": "job-3",
+        "status": "completed",
+        "error": None,
+        "result": {
+            "facts_extracted": 1,
+            "memories_created": 1,
+            "memories_updated": 0,
+            "events": [{"memory_id": "m3", "content": "A fact.", "event": "ADD"}],
+        },
+    }))
+
+    out = asyncio.run(S.hebbrix_extraction_status("job-3", collection_id="c1"))
+
+    assert out["status"] == "completed"
+    assert out["memories"] == [{"id": "m3", "content": "A fact.", "event": "ADD"}]
+    assert client.calls[-1][1].endswith("/v1/memories/jobs/job-3")
+
+
+def test_extraction_status_preserves_terminal_failure(monkeypatch):
+    _fake(monkeypatch, FakeResponse(200, {
+        "job_id": "job-failed",
+        "status": "FAILED",
+        "error": "extraction provider unavailable",
+        "result": {},
+    }))
+
+    out = asyncio.run(S.hebbrix_extraction_status("job-failed", collection_id="c1"))
+
+    assert out["status"] == "failed"
+    assert out["searchable"] is False
+    assert out["graph_enrichment"] == "failed"
+    assert out["error"] == "extraction provider unavailable"
 
 
 def test_remember_wait_for_index_false_passthrough(monkeypatch):
@@ -915,6 +1017,22 @@ def test_forget_on_remote_404_also_tombstones(monkeypatch):
     _fake(monkeypatch, FakeResponse(404, text="already gone"))
     d = asyncio.run(S.hebbrix_forget("m1"))
     assert d["ok"] is False and S._is_tombstoned("m1")  # idempotent delete
+    assert d["status"] == 404 and "error" in d  # same structured shape as get
+    assert d["deleted"] is False and d["already_absent"] is True
+
+
+def test_forget_success_has_stable_deleted_shape(monkeypatch):
+    _fake(monkeypatch, FakeResponse(204, {}))
+
+    out = asyncio.run(S.hebbrix_forget("m-success"))
+
+    assert out == {
+        "status": 204,
+        "ok": True,
+        "deleted": True,
+        "memory_id": "m-success",
+    }
+    assert S._is_tombstoned("m-success") is True
 
 
 def test_forget_on_5xx_does_not_tombstone(monkeypatch):
@@ -1095,6 +1213,28 @@ def test_error_response_still_carries_usage_block(monkeypatch):
     assert out["error"].startswith("HTTP 402")
     assert out["hebbrix_usage"]["status"] == "limited"
     assert "claim" in out["hebbrix_usage"]["action_for_human"].lower()
+
+
+def test_error_parser_accepts_fastapi_detail_envelope():
+    out = S._err(FakeResponse(429, {
+        "detail": {"code": "AGENT_SIGNUP_AT_CAPACITY", "message": "Try later"}
+    }))
+
+    assert out["error_code"] == "AGENT_SIGNUP_AT_CAPACITY"
+    assert out["error"] == "HTTP 429: AGENT_SIGNUP_AT_CAPACITY: Try later"
+    assert out["ok"] is False
+
+
+def test_error_parser_accepts_nested_gateway_envelope():
+    out = S._err(FakeResponse(429, {
+        "error": {"message": {
+            "code": "MINT_SUBNET_LIMIT",
+            "message": "Shared network limit reached",
+        }}
+    }))
+
+    assert out["error_code"] == "MINT_SUBNET_LIMIT"
+    assert "Shared network limit reached" in out["error"]
 
 
 # ============ confidence surfaces constraint conflict (v0.3.15) =============

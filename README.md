@@ -34,7 +34,7 @@ Add this to your MCP client config. On first run with no API key, the server min
 
 Restart the client. Done — your agent now has persistent memory.
 
-The free agent account includes **300 learning events** and **2,000 retrievals**, and expires 14 days after last use if unclaimed. Every tool result carries a `hebbrix_usage` block so the agent always knows where it stands and will tell you when it's time to claim.
+The free agent account includes **300 learning events** and **2,000 retrievals**, and expires 14 days after last use if unclaimed. The first tool result carries a `hebbrix_usage` block; it is sent again when status changes, usage crosses a 50/75/90% band, or the account is constrained. This keeps the agent informed without repeatedly consuming context tokens.
 
 **Keep it forever** (same key, all memories carry over, unlocks the free monthly tier):
 
@@ -122,6 +122,7 @@ All optional. With nothing set, the server starts in agent mode.
 | `HEBBRIX_MCP_HOST` | `127.0.0.1` | Bind host (HTTP transports) |
 | `HEBBRIX_MCP_PORT` | `8080` | Bind port (HTTP transports) |
 | `HEBBRIX_MCP_MULTI_TENANT` | off | Hosted mode: per-request `Authorization` header auth |
+| `HEBBRIX_EXTRACTION_POLL_SECONDS` | `20` (max `25`) | How long `extract=true` waits for smart ingestion before returning a poll instruction |
 
 ## Available Tools
 
@@ -129,7 +130,8 @@ A server-level instruction block teaches the model when to reach for each tool, 
 
 **Memory**
 
-- `hebbrix_remember` - Store a fact, decision, or preference.
+- `hebbrix_remember` - Store a fact, decision, or preference. With `extract=true`, smart ingestion is a tracked job and is polled for up to 20 seconds by default; set `wait_for_extraction=false` for immediate acknowledgement.
+- `hebbrix_extraction_status` - Poll a smart-ingestion `job_id`; returns the created/updated atomic memories when complete and a structured failure when unsuccessful.
     - `content` (string, required): the memory text
     - `tags` (list, optional), `collection_id` (string, optional)
     - `extract` (bool, default false): false stores the text exactly (one memory); true runs fact-extraction and may create several atomic memories
@@ -140,7 +142,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
     - `min_score` (float, default 0.0): drop weak matches — zero-relevance padding is always dropped; raise this to filter noise so you don't pay tokens for it.
 - `hebbrix_get` - Fetch one memory by id, with metadata.
 - `hebbrix_update` - Correct a memory **in place** (old versions are kept).
-- `hebbrix_forget` - Delete a memory by id.
+- `hebbrix_forget` - Delete a memory by id. Returns `deleted=true` on success and `already_absent=true` for an idempotent repeat.
 - `hebbrix_list` - List recent memories.
 - `hebbrix_history` - See how a memory changed over time.
 - `hebbrix_mark_used` - Reinforce a memory you actually used (`helpful=True` strengthens it, `False` weakens it) so recall improves over time.

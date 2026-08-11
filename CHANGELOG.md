@@ -1,5 +1,39 @@
 # Changelog
 
+## 0.3.23 — 2026-08-10
+
+Independent product-evaluation remediations for the MCP contract.
+
+- **Smart ingestion is now trackable end to end.** `hebbrix_remember(extract=true)`
+  explicitly requests asynchronous extraction, polls the durable job for up to
+  20 seconds by default, and returns real atomic memory IDs/content when it
+  completes. A caller can opt into immediate acknowledgement with
+  `wait_for_extraction=false`; timed-out and non-blocking responses retain
+  `job_id`, `poll_url`, status, and an explicit next action.
+- **Added `hebbrix_extraction_status`.** Agents can poll a smart-ingestion job
+  after the initial tool call instead of receiving null IDs and an untrackable
+  `pending` state.
+- **Normalized API errors.** FastAPI `detail`, legacy `error`, and nested gateway
+  envelopes now produce one structured shape with `error`, `error_code`,
+  `status`, and `ok=false`. Delete/forget errors use the same shape as get and
+  other tools. WAF failures retain their explicit non-persistence warning.
+- **Normalized delete and terminal job results against the real API.** A 204
+  forget response now returns `deleted=true` with the memory id; a repeated
+  delete is explicitly `already_absent=true`. Smart-ingestion jobs containing
+  the backend's normal `error: null` field are shaped into atomic memories
+  instead of leaking the raw polling envelope.
+- **Accountless startup has a hard 28-second client budget.** Challenge, proof
+  of work, and mint calls share one deadline instead of accumulating independent
+  timeouts beyond the advertised startup experience.
+- **Usage documentation matches the implementation.** Usage metadata is emitted
+  on the first result, material band/status changes, and constrained states—not
+  redundantly on every unchanged result.
+
+## 0.3.22 — 2026-07-29
+
+- Pinned `mcp[cli]` below 2.0 because MCP 2.0 removed the FastMCP import path used
+  by this release. Clean installs no longer resolve to an incompatible SDK.
+
 ## 0.3.21 — 2026-07-13
 
 Red-team hardening (adversarial agent report). Two of the six reported findings
