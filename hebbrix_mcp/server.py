@@ -886,6 +886,52 @@ def _shape_graph(entity: str, data: dict) -> dict[str, Any]:
     return out
 
 
+def _append_missing_graph_facts(
+    answer: Optional[str], relationships: list[dict[str, Any]]
+) -> tuple[Optional[str], int]:
+    """Put scoped graph evidence in the answer, not only beside the answer.
+
+    ``hebbrix_ask`` already obtains a synthesized memory answer and a bounded,
+    entity-scoped graph traversal. Previously the traversal was attached only as
+    metadata, so a correct manager/database edge could be invisible in the text
+    an agent actually consumed. Render only graph facts not already covered by
+    the answer. This is deterministic, adds no model call, and is relation- and
+    tenant-agnostic.
+    """
+
+    if not answer or not relationships:
+        return answer, 0
+    answer_folded = " ".join(str(answer).casefold().split())
+    rendered: list[str] = []
+    seen: set[tuple[str, str, str]] = set()
+    for relationship in relationships:
+        if not isinstance(relationship, dict):
+            continue
+        source = str(relationship.get("from") or "").strip()
+        target = str(relationship.get("to") or "").strip()
+        relation = str(relationship.get("type") or "").strip()
+        if not source or not target or not relation:
+            continue
+        key = (source.casefold(), relation.casefold(), target.casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        phrase = " ".join(relation.replace("_", " ").replace("-", " ").split())
+        relation_stem = phrase.casefold().split()[0].rstrip("s")
+        already_covered = (
+            source.casefold() in answer_folded
+            and target.casefold() in answer_folded
+            and relation_stem in answer_folded
+        )
+        if already_covered:
+            continue
+        rendered.append(f"{source} {phrase} {target}")
+    if not rendered:
+        return answer, 0
+    suffix = "; ".join(rendered)
+    return f"{answer.rstrip()}\n\nGraph-backed facts: {suffix}.", len(rendered)
+
+
 # --------------------------------------------------------------------------- #
 # Memory tools (CRUD + version history)                                        #
 # --------------------------------------------------------------------------- #
@@ -1454,6 +1500,11 @@ async def hebbrix_ask(
                     graph.append(rel)
             if graph:
                 out["graph"] = graph
+                out["answer"], added = _append_missing_graph_facts(
+                    out.get("answer"), graph
+                )
+                if added:
+                    out["graph_facts_added_to_answer"] = added
         except Exception:
             pass  # enrichment is best-effort, never fail the answer
     # 3) Durable profile facts (the "about me" context).

@@ -472,6 +472,54 @@ def test_ask_uses_reason_and_cites(monkeypatch):
     assert out["citations"] == [{"id": "m1", "content": "Sarah works on Atlas", "score": 0.9}]
 
 
+def test_ask_merges_missing_scoped_graph_facts_into_answer(monkeypatch):
+    class GraphAskClient(FakeClient):
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            if url.endswith("/search/reason"):
+                return FakeResponse(200, {
+                    "answer": "Project Orion launches on September 12, 2026.",
+                    "sources": [],
+                })
+            if url.endswith("/knowledge-graph/query"):
+                return FakeResponse(200, {"results": [
+                    {"source": {"name": "Mira"},
+                     "target": {"name": "Project Orion"},
+                     "relationship_type": "manages"},
+                    {"source": {"name": "Project Orion"},
+                     "target": {"name": "TimescaleDB"},
+                     "relationship_type": "uses"},
+                    {"source": {"name": "Project Orion"},
+                     "target": {"name": "September 12, 2026"},
+                     "relationship_type": "launches_on"},
+                ]})
+            return FakeResponse(200, {})
+
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/knowledge-graph/entities" in url:
+                return FakeResponse(200, {"entities": [
+                    {"name": "Project Orion", "type": "object"},
+                    {"name": "Project Lyra", "type": "object"},
+                ]})
+            if "/profile/facts" in url:
+                return FakeResponse(200, {"static": []})
+            return FakeResponse(200, {})
+
+    client = GraphAskClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+
+    out = asyncio.run(S.hebbrix_ask(
+        "Who manages Project Orion, what database does it use, and when does it launch?",
+        collection_id="c1",
+    ))
+
+    assert "Mira manages Project Orion" in out["answer"]
+    assert "Project Orion uses TimescaleDB" in out["answer"]
+    assert "Project Lyra" not in out["answer"]
+    assert out["graph_facts_added_to_answer"] == 2
+
+
 def test_ask_falls_back_to_search_when_reason_unavailable(monkeypatch):
     class AskClient(FakeClient):
         async def post(self, url, **kw):
