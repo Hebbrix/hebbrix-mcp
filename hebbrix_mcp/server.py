@@ -96,6 +96,13 @@ UPSTREAM_MAX_KEEPALIVE = min(
 UPSTREAM_KEEPALIVE_EXPIRY = max(
     5.0, float(os.environ.get("HEBBRIX_UPSTREAM_KEEPALIVE_EXPIRY", "30"))
 )
+try:
+    MCP_RELEVANCE_FLOOR = max(
+        0.01,
+        min(float(os.environ.get("HEBBRIX_MCP_RELEVANCE_FLOOR", "0.20")), 1.0),
+    )
+except (TypeError, ValueError):
+    MCP_RELEVANCE_FLOOR = 0.20
 
 # Saved credentials from a previous auto-provision (agent mode). Env vars win.
 CONFIG_PATH = Path(os.environ.get("HEBBRIX_CONFIG", "~/.hebbrix/config.json")).expanduser()
@@ -213,6 +220,30 @@ def _sig_tokens(text: Optional[str]) -> set:
         t for t in re.findall(r"[a-z0-9]+", (text or "").lower())
         if len(t) >= 2 and t not in _OVERLAY_STOPWORDS
     }
+
+
+def _uncalibrated_results_need_verification(query: str, data: dict[str, Any]) -> bool:
+    """True when the API explicitly returned relative scores with no lexical anchor.
+
+    Relative fusion scores rank candidates within one request; they do not prove
+    that any candidate is relevant. A substantive lexical anchor is enough for
+    the low-latency path. Otherwise MCP performs one calibrated retry so semantic
+    paraphrases survive while out-of-domain nearest-neighbour noise is suppressed.
+    Missing calibration metadata means an older API and remains backward-compatible.
+    """
+
+    if data.get("scores_calibrated") is not False:
+        return False
+    results = [row for row in (data.get("results") or []) if isinstance(row, dict)]
+    if not results:
+        return False
+    query_tokens = _sig_tokens(query)
+    if not query_tokens:
+        return True
+    return not any(
+        query_tokens & _sig_tokens(str(row.get("content") or ""))
+        for row in results
+    )
 
 
 def _overlay_recent_writes(
@@ -872,6 +903,13 @@ def _shape_graph(entity: str, data: dict) -> dict[str, Any]:
         conf = r.get("confidence")
         if conf is not None:
             row["confidence"] = round(conf, 3) if isinstance(conf, (int, float)) else conf
+        source_memory_id = r.get("source_memory_id") or (
+            r.get("properties") or {}
+        ).get("source_memory_id")
+        if source_memory_id:
+            row["source_memory_id"] = str(source_memory_id)
+        if r.get("assertion_id"):
+            row["assertion_id"] = str(r["assertion_id"])
         rels.append(row)
     ents_in = data.get("entities") or data.get("nodes") or []
     ents = [{"name": _node_name(e), "type": _node_type(e)}
@@ -888,7 +926,7 @@ def _shape_graph(entity: str, data: dict) -> dict[str, Any]:
 
 def _append_missing_graph_facts(
     answer: Optional[str], relationships: list[dict[str, Any]]
-) -> tuple[Optional[str], int]:
+) -> tuple[Optional[str], list[dict[str, Any]]]:
     """Put scoped graph evidence in the answer, not only beside the answer.
 
     ``hebbrix_ask`` already obtains a synthesized memory answer and a bounded,
@@ -900,9 +938,9 @@ def _append_missing_graph_facts(
     """
 
     if not answer or not relationships:
-        return answer, 0
+        return answer, []
     answer_folded = " ".join(str(answer).casefold().split())
-    rendered: list[str] = []
+    rendered: list[dict[str, Any]] = []
     seen: set[tuple[str, str, str]] = set()
     for relationship in relationships:
         if not isinstance(relationship, dict):
@@ -925,11 +963,36 @@ def _append_missing_graph_facts(
         )
         if already_covered:
             continue
-        rendered.append(f"{source} {phrase} {target}")
+        rendered.append(
+            {
+                "fact": f"{source} {phrase} {target}",
+                "id": relationship.get("source_memory_id"),
+                "score": relationship.get("confidence"),
+            }
+        )
     if not rendered:
-        return answer, 0
-    suffix = "; ".join(rendered)
-    return f"{answer.rstrip()}\n\nGraph-backed facts: {suffix}.", len(rendered)
+        return answer, []
+
+    # A memory-only synthesis can truthfully say it could not verify a field and
+    # the subsequent graph traversal can then verify it. Preserve that provenance
+    # distinction without leaving a self-contradictory final answer.
+    reconciled = re.sub(
+        r"(?:\n|\s)+(?:I\s+)?could not verify:\s*.*?"
+        r"(?:Confirm those details with an authoritative source before acting\.)?"
+        r"(?=\n|$)",
+        (
+            "\nMemory search alone was incomplete; the independently stored "
+            "graph evidence below supplies additional relationships."
+        ),
+        answer.rstrip(),
+        flags=re.IGNORECASE,
+    )
+    cited_facts = [
+        f"{item['fact']} [G{index}]"
+        for index, item in enumerate(rendered, start=1)
+    ]
+    suffix = "; ".join(cited_facts)
+    return f"{reconciled}\n\nGraph-backed facts: {suffix}.", rendered
 
 
 # --------------------------------------------------------------------------- #
@@ -1119,9 +1182,10 @@ async def hebbrix_search(
     """Semantic search over memories. Always call this BEFORE answering questions
     that depend on prior context, decisions, or user preferences.
 
-    Zero-relevance padding rows are always dropped. Raise `min_score` (0.0-1.0) to
-    also filter weak matches — e.g. min_score=0.3 keeps only reasonably relevant
-    results, so you don't pay tokens for noise.
+    Zero-relevance padding rows are always dropped. If the fast API returns only
+    uncalibrated nearest-neighbour candidates with no lexical anchor, Hebbrix
+    automatically verifies them with calibrated retrieval and suppresses noise.
+    Raise `min_score` (0.0-1.0) to request an explicit absolute relevance floor.
 
     Returns {"query", "count", "results": [{"id","content","score"}]}.
     """
@@ -1130,9 +1194,41 @@ async def hebbrix_search(
         return _fail("no collection_id is available for this MCP session")
     limit = max(1, min(int(limit), 100))
     min_score = max(0.0, min(float(min_score), 1.0))
-    data = await _post("/search", {"query": query, "collection_id": cid, "limit": limit})
+    search_body: dict[str, Any] = {
+        "query": query,
+        "collection_id": cid,
+        "limit": limit,
+    }
+    if min_score > 0.0:
+        search_body["threshold"] = min_score
+    data = await _post("/search", search_body)
     if "error" in data:
         return _u(data)
+    escalated_for_relevance = False
+    suppressed_unverified = 0
+    if min_score == 0.0 and _uncalibrated_results_need_verification(query, data):
+        escalated_for_relevance = True
+        unverified_count = len(data.get("results") or [])
+        verified = await _post(
+            "/search",
+            {
+                "query": query,
+                "collection_id": cid,
+                "limit": limit,
+                "threshold": MCP_RELEVANCE_FLOOR,
+            },
+        )
+        if isinstance(verified, dict) and "error" not in verified:
+            data = verified
+            # A thresholded retry is an absolute-relevance contract. If an older
+            # or degraded API still returns rows without confirming calibration,
+            # do not silently re-label relative nearest-neighbour scores as proof.
+            if data.get("results") and data.get("scores_calibrated") is not True:
+                suppressed_unverified = len(data.get("results") or [])
+                data = dict(data) | {"results": []}
+        else:
+            suppressed_unverified = unverified_count
+            data = dict(data) | {"results": []}
     # Reconcile remote results against this session's mutations so read-after-write
     # holds for updates and deletes, not just creates:
     #  - a tombstoned (deleted) id is dropped even if the remote index still has it
@@ -1147,12 +1243,18 @@ async def hebbrix_search(
         # zero-relevance rows, and an agent shouldn't treat those as recall. A
         # just-written / corrected memory that happens to land here is re-surfaced
         # by the overlay below with a real overlap score, so read-after-write is
-        # preserved. Any positive score (even a weak match) is kept.
+        # preserved. Explicit low-confidence rows are never presented as ordinary
+        # MCP evidence; callers can use the REST API's include_low_confidence mode
+        # for retrieval diagnostics.
         _sc = i.get("score") or 0.0
-        if _sc <= 0.0 or _sc < min_score:
+        if _sc <= 0.0 or _sc < min_score or i.get("low_confidence") is True:
             continue
         row = {"id": rid, "content": i.get("content"),
                "score": round(_sc, 3)}
+        if i.get("normalized_score") is not None:
+            row["normalized_score"] = round(float(i["normalized_score"]), 3)
+        if "score_calibrated" in i:
+            row["score_calibrated"] = bool(i.get("score_calibrated"))
         if rid is not None:
             cw = _cached_write(rid)
             # Only override + flag "corrected" when the cached content ACTUALLY
@@ -1183,9 +1285,39 @@ async def hebbrix_search(
                     "score": _os, "just_written": True})
     out.sort(key=lambda r: r.get("score") or 0.0, reverse=True)
     out = out[:limit]
-    return _u(_fence_results({"query": query, "count": len(out), "results": out,
-                              "processing_time_ms": data.get("processing_time_ms")},
-                             "results"))
+    calibration_known = "scores_calibrated" in data
+    calibrated = bool(data.get("scores_calibrated")) if calibration_known else None
+    confidence: dict[str, Any] = {
+        "status": (
+            "no_confident_match"
+            if escalated_for_relevance and not out
+            else (
+                "calibrated"
+                if calibrated
+                else "relative_scores_only"
+            )
+        ),
+        "scores_calibrated": calibrated,
+        "query_confidence": data.get("query_confidence"),
+        "ranking_policy": data.get("ranking_policy"),
+        "reranker_applied": data.get("reranker_applied"),
+        "escalated_for_relevance": escalated_for_relevance,
+    }
+    if suppressed_unverified:
+        confidence["suppressed_unverified_results"] = suppressed_unverified
+    payload = {
+        "query": query,
+        "count": len(out),
+        "results": out,
+        "processing_time_ms": data.get("processing_time_ms"),
+        "retrieval_confidence": confidence,
+    }
+    if calibrated is False and out:
+        payload["warning"] = (
+            "Scores are relative ranking values, not calibrated relevance "
+            "probabilities; treat these as candidate memories, not proof."
+        )
+    return _u(_fence_results(payload, "results"))
 
 
 @mcp.tool()
@@ -1504,7 +1636,23 @@ async def hebbrix_ask(
                     out.get("answer"), graph
                 )
                 if added:
-                    out["graph_facts_added_to_answer"] = added
+                    graph_citations = []
+                    for index, item in enumerate(added, start=1):
+                        graph_citations.append(
+                            {
+                                "citation": f"G{index}",
+                                "id": item.get("id"),
+                                "content": item.get("fact"),
+                                "score": item.get("score"),
+                                "source": "knowledge_graph",
+                            }
+                        )
+                    citations = out.get("citations")
+                    if not isinstance(citations, list):
+                        citations = []
+                        out["citations"] = citations
+                    citations.extend(graph_citations)
+                    out["graph_facts_added_to_answer"] = len(added)
         except Exception:
             pass  # enrichment is best-effort, never fail the answer
     # 3) Durable profile facts (the "about me" context).

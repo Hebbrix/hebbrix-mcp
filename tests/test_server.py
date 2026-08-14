@@ -485,10 +485,12 @@ def test_ask_merges_missing_scoped_graph_facts_into_answer(monkeypatch):
                 return FakeResponse(200, {"results": [
                     {"source": {"name": "Mira"},
                      "target": {"name": "Project Orion"},
-                     "relationship_type": "manages"},
+                     "relationship_type": "manages",
+                     "source_memory_id": "m-manager"},
                     {"source": {"name": "Project Orion"},
                      "target": {"name": "TimescaleDB"},
-                     "relationship_type": "uses"},
+                     "relationship_type": "uses",
+                     "source_memory_id": "m-database"},
                     {"source": {"name": "Project Orion"},
                      "target": {"name": "September 12, 2026"},
                      "relationship_type": "launches_on"},
@@ -518,6 +520,45 @@ def test_ask_merges_missing_scoped_graph_facts_into_answer(monkeypatch):
     assert "Project Orion uses TimescaleDB" in out["answer"]
     assert "Project Lyra" not in out["answer"]
     assert out["graph_facts_added_to_answer"] == 2
+    assert "[G1]" in out["answer"] and "[G2]" in out["answer"]
+    assert [row["source"] for row in out["citations"]] == [
+        "knowledge_graph",
+        "knowledge_graph",
+    ]
+    assert {row["id"] for row in out["citations"]} == {
+        "m-manager",
+        "m-database",
+    }
+
+
+def test_graph_evidence_reconciles_memory_only_abstention():
+    answer, added = S._append_missing_graph_facts(
+        (
+            "Project Orion launches on September 12, 2026.\n"
+            "I could not verify: manager; database. Confirm those details with "
+            "an authoritative source before acting."
+        ),
+        [
+            {
+                "from": "Mira",
+                "to": "Project Orion",
+                "type": "manages",
+                "source_memory_id": "m1",
+            },
+            {
+                "from": "Project Orion",
+                "to": "TimescaleDB",
+                "type": "uses",
+                "source_memory_id": "m2",
+            },
+        ],
+    )
+
+    assert "could not verify" not in answer.lower()
+    assert "memory search alone was incomplete" in answer.lower()
+    assert "Mira manages Project Orion [G1]" in answer
+    assert "Project Orion uses TimescaleDB [G2]" in answer
+    assert [item["id"] for item in added] == ["m1", "m2"]
 
 
 def test_ask_falls_back_to_search_when_reason_unavailable(monkeypatch):
@@ -1542,6 +1583,148 @@ def test_search_keeps_weak_positive_match(monkeypatch):
         {"memory_id": "weak", "content": "barely relevant", "score": 0.002}]}))
     out = asyncio.run(S.hebbrix_search("relevant", collection_id="c1"))
     assert any(r["id"] == "weak" for r in out["results"])   # positive score kept
+
+
+def test_search_calibrates_and_suppresses_out_of_domain_noise(monkeypatch):
+    calls = []
+    responses = iter([
+        {
+            "scores_calibrated": False,
+            "ranking_policy": "adaptive-narrow-head",
+            "reranker_applied": False,
+            "results": [{
+                "memory_id": "noise",
+                "content": "The user has a Golden Retriever named Mochi.",
+                "score": 0.275,
+                "score_calibrated": False,
+            }],
+        },
+        {
+            "scores_calibrated": True,
+            "ranking_policy": "calibrated",
+            "reranker_applied": True,
+            "results": [],
+        },
+    ])
+
+    async def fake_post(path, body):
+        calls.append((path, body))
+        return next(responses)
+
+    monkeypatch.setattr(S, "_post", fake_post)
+    out = asyncio.run(S.hebbrix_search(
+        "What is the tensile strength of lunar basalt on Europa?",
+        collection_id="c1",
+    ))
+
+    assert out["results"] == []
+    assert out["retrieval_confidence"]["status"] == "no_confident_match"
+    assert out["retrieval_confidence"]["escalated_for_relevance"] is True
+    assert len(calls) == 2
+    assert calls[1][1]["threshold"] == S.MCP_RELEVANCE_FLOOR
+
+
+def test_search_calibration_preserves_semantic_paraphrase(monkeypatch):
+    responses = iter([
+        {
+            "scores_calibrated": False,
+            "results": [{
+                "memory_id": "candidate",
+                "content": "Mochi is a Golden Retriever.",
+                "score": 0.31,
+            }],
+        },
+        {
+            "scores_calibrated": True,
+            "reranker_applied": True,
+            "query_confidence": 0.91,
+            "results": [{
+                "memory_id": "candidate",
+                "content": "Mochi is a Golden Retriever.",
+                "score": 0.91,
+                "normalized_score": 0.91,
+                "score_calibrated": True,
+            }],
+        },
+    ])
+
+    async def fake_post(_path, _body):
+        return next(responses)
+
+    monkeypatch.setattr(S, "_post", fake_post)
+    out = asyncio.run(S.hebbrix_search(
+        "Which animal lives with the user?",
+        collection_id="c1",
+    ))
+
+    assert [row["id"] for row in out["results"]] == ["candidate"]
+    assert out["results"][0]["score_calibrated"] is True
+    assert out["retrieval_confidence"]["status"] == "calibrated"
+
+
+def test_search_suppresses_thresholded_rows_when_api_cannot_calibrate(monkeypatch):
+    responses = iter([
+        {
+            "scores_calibrated": False,
+            "results": [{
+                "memory_id": "candidate",
+                "content": "Mochi is a Golden Retriever.",
+                "score": 0.31,
+            }],
+        },
+        {
+            "scores_calibrated": False,
+            "reranker_applied": False,
+            "results": [{
+                "memory_id": "candidate",
+                "content": "Mochi is a Golden Retriever.",
+                "score": 0.29,
+            }],
+        },
+    ])
+
+    async def fake_post(_path, _body):
+        return next(responses)
+
+    monkeypatch.setattr(S, "_post", fake_post)
+    out = asyncio.run(S.hebbrix_search(
+        "Which animal lives with the user?",
+        collection_id="c1",
+    ))
+
+    assert out["results"] == []
+    assert out["retrieval_confidence"]["status"] == "no_confident_match"
+    assert out["retrieval_confidence"]["suppressed_unverified_results"] == 1
+
+
+def test_search_exposes_uncalibrated_lexical_match(monkeypatch):
+    calls = []
+
+    async def fake_post(path, body):
+        calls.append((path, body))
+        return {
+            "scores_calibrated": False,
+            "ranking_policy": "adaptive-narrow-head",
+            "reranker_applied": False,
+            "results": [{
+                "memory_id": "m1",
+                "content": "Project Atlas launches on Friday.",
+                "score": 0.42,
+                "score_calibrated": False,
+            }],
+        }
+
+    monkeypatch.setattr(S, "_post", fake_post)
+    out = asyncio.run(S.hebbrix_search(
+        "When does Project Atlas launch?",
+        collection_id="c1",
+    ))
+
+    assert len(calls) == 1
+    assert out["count"] == 1
+    assert out["results"][0]["score_calibrated"] is False
+    assert out["retrieval_confidence"]["status"] == "relative_scores_only"
+    assert "not calibrated relevance probabilities" in out["warning"]
 
 
 # =========== error paths carry the usage/claim block (v0.3.14) ==============
