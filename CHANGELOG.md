@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.4 — 2026-08-14
+
+- Encrypt hosted guest-session cookies with authenticated AES-GCM so the
+  tenant API key is never recoverable from client-visible cookie bytes.
+- Reject the legacy signed-but-readable guest-cookie format instead of
+  silently preserving credentials exposed under the old contract.
+- Encode every memory identifier as one URL path segment across get, update,
+  forget, and history tools, preventing path traversal into unrelated API
+  routes even when a hostile identifier is supplied.
+
 ## 0.5.1 — 2026-08-10
 
 - Made smart ingestion explicitly asynchronous and reliable: `extract=true`
