@@ -47,6 +47,7 @@ from typing import Any, Optional
 from urllib.parse import quote, urlparse
 
 import httpx
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
 
@@ -517,6 +518,16 @@ def _auth_headers() -> dict[str, str]:
 
 def _cid(collection_id: Optional[str]) -> Optional[str]:
     return collection_id or _REQUEST_COLLECTION.get() or DEFAULT_COLLECTION or None
+
+
+def _path_segment(value: Any) -> str:
+    """Encode an untrusted identifier as exactly one URL path segment.
+
+    ``urllib.parse.quote`` intentionally leaves dots unescaped because they are
+    RFC-unreserved. Encode them explicitly so even a proxy that normalizes dot
+    segments before forwarding cannot turn an identifier into ``../`` traversal.
+    """
+    return quote(str(value), safe="").replace(".", "%2E")
 
 
 def _fail(message: str, status: Optional[int] = None, **extra: Any) -> dict[str, Any]:
@@ -1328,7 +1339,7 @@ async def hebbrix_get(memory_id: str) -> dict[str, Any]:
     # apparently-valid memory).
     if _is_tombstoned(memory_id):
         return _u({"error": "not found", "id": str(memory_id), "deleted": True})
-    data = await _get(f"/memories/{memory_id}")
+    data = await _get(f"/memories/{_path_segment(memory_id)}")
     if isinstance(data, dict) and "error" in data:
         # Get-after-write: a memory written/corrected moments ago may not be
         # readable remotely yet. Serve the local copy so the id we just handed
@@ -1358,7 +1369,7 @@ async def hebbrix_update(
         return _fail("pass content and/or importance to update")
     if importance is not None:
         importance = max(0.0, min(float(importance), 1.0))
-    data = await _patch(f"/memories/{memory_id}", {
+    data = await _patch(f"/memories/{_path_segment(memory_id)}", {
         "content": content, "importance": importance, "wait_for_index": wait_for_index})
     if isinstance(data, dict) and "error" in data:
         return _u(data)
@@ -1379,7 +1390,7 @@ async def hebbrix_forget(memory_id: str) -> dict[str, Any]:
     ``already_absent=true``. This stable tool shape does not depend on whether
     the API's successful DELETE response has a JSON body.
     """
-    result = await _delete(f"/memories/{memory_id}")
+    result = await _delete(f"/memories/{_path_segment(memory_id)}")
     # On a confirmed delete (2xx) OR a remote 404 (already gone), tombstone the id
     # so it can't be resurrected this session by the local overlay or a stale
     # remote row. Do NOT tombstone on any other failure (5xx / network).
@@ -1434,7 +1445,7 @@ async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> 
 async def hebbrix_history(memory_id: str) -> dict[str, Any]:
     """Show the version history of a memory (how it changed over time, including
     supersessions). Useful to see what a fact used to be."""
-    data = await _get(f"/memories/{memory_id}/history")
+    data = await _get(f"/memories/{_path_segment(memory_id)}/history")
     if "error" in data:
         return _u(data)
     versions = data.get("history") or data.get("versions") or (data if isinstance(data, list) else [])
@@ -2327,36 +2338,46 @@ def _b64url_decode(value: str) -> bytes:
 
 
 def _session_cookie_value(api_key: str, collection_id: str, expires_at: int) -> str:
-    """Create a compact signed guest session carried by the MCP HTTP client.
+    """Create a compact authenticated-encrypted guest session cookie.
 
     The API key belongs to the guest and is only sent in a Secure, HttpOnly
-    cookie. Signing makes the stateless cookie safe across multiple MCP replicas
-    without introducing a server-side session database.
+    cookie. AES-GCM keeps that bearer secret confidential as well as tamper-proof
+    while preserving stateless operation across multiple MCP replicas.
     """
     if len(SESSION_SECRET) < 32:
         raise RuntimeError("HEBBRIX_MCP_SESSION_SECRET must be at least 32 characters")
-    payload = _b64url(json.dumps({
-        "v": 1, "k": api_key, "c": collection_id, "e": int(expires_at)
-    }, separators=(",", ":")).encode())
-    signature = _b64url(hmac.new(
-        SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
-    ).digest())
-    return f"{payload}.{signature}"
+    plaintext = json.dumps({
+        "v": 2, "k": api_key, "c": collection_id, "e": int(expires_at)
+    }, separators=(",", ":")).encode()
+    key = hashlib.sha256(
+        b"hebbrix-mcp-guest-cookie-v2\0" + SESSION_SECRET.encode()
+    ).digest()
+    nonce = os.urandom(12)
+    ciphertext = AESGCM(key).encrypt(
+        nonce, plaintext, b"hebbrix_mcp_session:v2"
+    )
+    return f"v2.{_b64url(nonce + ciphertext)}"
 
 
 def _verify_session_cookie(value: str) -> Optional[dict[str, Any]]:
-    """Verify and decode a guest cookie; return None for any invalid input."""
+    """Decrypt and verify a v2 guest cookie; reject legacy plaintext cookies."""
     if not value or len(SESSION_SECRET) < 32:
         return None
     try:
-        payload, supplied = value.split(".", 1)
-        expected = _b64url(hmac.new(
-            SESSION_SECRET.encode(), payload.encode(), hashlib.sha256
-        ).digest())
-        if not hmac.compare_digest(expected, supplied):
+        version, encoded = value.split(".", 1)
+        if version != "v2":
             return None
-        data = json.loads(_b64url_decode(payload))
-        if data.get("v") != 1 or int(data.get("e", 0)) <= int(time.time()):
+        sealed = _b64url_decode(encoded)
+        if len(sealed) < 12 + 16:
+            return None
+        key = hashlib.sha256(
+            b"hebbrix-mcp-guest-cookie-v2\0" + SESSION_SECRET.encode()
+        ).digest()
+        plaintext = AESGCM(key).decrypt(
+            sealed[:12], sealed[12:], b"hebbrix_mcp_session:v2"
+        )
+        data = json.loads(plaintext)
+        if data.get("v") != 2 or int(data.get("e", 0)) <= int(time.time()):
             return None
         if not (str(data.get("k", "")).startswith("mem_") and data.get("c")):
             return None

@@ -1300,6 +1300,41 @@ def test_accountless_cookie_reconnects_without_remint(monkeypatch):
     assert any(k.lower() == b"set-cookie" for k, _ in start["headers"])
 
 
+def test_guest_cookie_encrypts_bearer_and_rejects_legacy_plaintext(monkeypatch):
+    monkeypatch.setattr(S, "SESSION_SECRET", "s" * 48)
+    cookie = S._session_cookie_value(
+        "mem_sk_do_not_disclose", "guest-c", int(__import__("time").time()) + 3600
+    )
+    assert cookie.startswith("v2.")
+    assert "mem_sk" not in cookie
+    assert b"mem_sk" not in S._b64url_decode(cookie.split(".", 1)[1])
+    assert S._verify_session_cookie(cookie)["k"] == "mem_sk_do_not_disclose"
+
+    legacy_payload = S._b64url(json.dumps({
+        "v": 1, "k": "mem_sk_do_not_disclose", "c": "guest-c", "e": 4102444800
+    }, separators=(",", ":")).encode())
+    legacy_signature = S._b64url(__import__("hmac").new(
+        S.SESSION_SECRET.encode(), legacy_payload.encode(), __import__("hashlib").sha256
+    ).digest())
+    assert S._verify_session_cookie(f"{legacy_payload}.{legacy_signature}") is None
+
+
+def test_memory_ids_are_single_url_path_segments(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(404, text="not found"))
+    hostile = "../../profile/facts?x=1#fragment"
+    asyncio.run(S.hebbrix_get(hostile))
+    asyncio.run(S.hebbrix_update(hostile, content="safe"))
+    asyncio.run(S.hebbrix_forget(hostile))
+    asyncio.run(S.hebbrix_history(hostile))
+
+    expected = "%2E%2E%2F%2E%2E%2Fprofile%2Ffacts%3Fx%3D1%23fragment"
+    urls = [call[1] for call in client.calls]
+    assert urls[0].endswith(f"/memories/{expected}")
+    assert urls[1].endswith(f"/memories/{expected}")
+    assert urls[2].endswith(f"/memories/{expected}")
+    assert urls[3].endswith(f"/memories/{expected}/history")
+
+
 def test_invalid_guest_cookie_is_rejected_without_identity_reset(monkeypatch):
     monkeypatch.setattr(S, "ACCOUNTLESS_HOSTED", True)
     monkeypatch.setattr(S, "SESSION_SECRET", "s" * 48)
