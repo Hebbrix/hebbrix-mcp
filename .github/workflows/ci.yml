@@ -25,5 +25,7 @@ jobs:
         run: ruff check hebbrix_mcp/ tests/
       - name: Compile check
         run: python -m py_compile hebbrix_mcp/server.py hebbrix_mcp/__init__.py
+      - name: Import contract (warnings are errors)
+        run: python -W error -c "import hebbrix_mcp.server"
       - name: Tests (offline — no network, no key)
-        run: pytest tests/ -q
+        run: pytest tests/ -q -W error

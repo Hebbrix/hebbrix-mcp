@@ -19,6 +19,17 @@ Your agent forgets everything when the session ends. This fixes that, and goes f
 
 Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other MCP client.
 
+### Release compatibility
+
+| MCP package | Hosted/API contract | Tool surface | Migration |
+|---|---|---:|---|
+| 0.5.6 | Hebbrix API r96 / OpenAPI 1.0.0 | 26 | None from 0.5.5 |
+
+The hosted server and PyPI package expose their exact package version during
+MCP initialization. The API exposes its immutable deployment build through
+`X-Hebbrix-Build` and `GET /v1/health/build`; OpenAPI `info.version` identifies
+the stable HTTP contract rather than a mutable deployment.
+
 ### Fastest setup: hosted, no account
 
 For an HTTP-capable MCP client, this is the entire setup:
