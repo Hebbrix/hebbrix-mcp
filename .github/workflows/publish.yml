@@ -8,7 +8,7 @@ on:
       tag:
         description: Git tag to publish
         required: true
-        default: v0.5.4
+        default: v0.5.6
         type: string
 
 permissions:
@@ -54,8 +54,11 @@ jobs:
       - name: Lint
         run: ruff check hebbrix_mcp/ tests/
 
+      - name: Import contract (warnings are errors)
+        run: python -W error -c "import hebbrix_mcp.server"
+
       - name: Test
-        run: pytest tests/ -q
+        run: pytest tests/ -q -W error
 
       - name: Build distributions
         run: python -m build

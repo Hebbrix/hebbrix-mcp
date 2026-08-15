@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.6 — 2026-08-15
+
+- Declared compatibility with the August 15, 2026 Hebbrix API r96 contract:
+  predicate-grounded search abstention, bounded 201/202 raw-write readiness,
+  and operation-specific idempotency metadata in OpenAPI.
+- Made warning-free import and the complete test suite mandatory under
+  `-W error` on Python 3.10, 3.11, 3.12, and 3.13.
+- Kept the public MCP surface stable at 26 tools; no client migration is
+  required from 0.5.5.
+
 ## 0.5.5 — 2026-08-15
 
 - Added explicit read-only, destructive, idempotent, and open-world MCP safety
