@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.5 — 2026-08-15
+
+- Added explicit read-only, destructive, idempotent, and open-world MCP safety
+  annotations to all 26 tools.
+- Scoped collection export profile reads to the requested collection.
+- Declared claim verification codes as write-only password inputs and kept
+  them out of server logs, errors, and results.
+- Rebuilt the upstream FastMCP settings model before server construction,
+  removing the unresolved `lifespan` import warning on supported Python and
+  Pydantic versions.
+
 ## 0.5.4 — 2026-08-14
 
 - Encrypt hosted guest-session cookies with authenticated AES-GCM so the

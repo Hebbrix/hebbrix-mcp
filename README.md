@@ -194,6 +194,13 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_claim_start` / `hebbrix_claim_verify` - Optionally keep an accountless
   guest memory permanently, without changing its collection or losing data.
 
+Every tool publishes explicit MCP safety annotations. `hebbrix_claim_start` is
+marked as an external side effect because it sends email; deletion is marked
+destructive; reads are marked read-only. The six-digit claim code is declared
+as a write-only password field and is never logged or returned by this server.
+MCP hosts still control their own tool-call history, so configure the host to
+redact secret inputs if it persists conversation or tracing data.
+
 The server also exposes a `hebbrix://profile` resource and a `context` prompt that inject the user's compiled profile.
 
 ## Make Hebbrix the agent's memory

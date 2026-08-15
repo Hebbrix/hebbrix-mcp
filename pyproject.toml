@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hebbrix-mcp"
-version = "0.5.4"
+version = "0.5.5"
 description = "Hebbrix MCP server — long-term memory and knowledge graph for any MCP-compatible agent (Claude Desktop, Cline, Cursor, etc.)"
 readme = "README.md"
 license = { text = "MIT" }
@@ -43,6 +43,7 @@ dependencies = [
     "mcp[cli]>=1.0,<2",
     "httpx[http2]>=0.27",
     "cryptography>=42",
+    "pydantic>=2.7",
 ]
 
 [project.optional-dependencies]
