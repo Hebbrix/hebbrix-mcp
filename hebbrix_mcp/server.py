@@ -47,9 +47,12 @@ from typing import Any, Optional
 from urllib.parse import quote, urlparse
 
 import httpx
+import mcp.server.fastmcp.server as _fastmcp_server
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from mcp.server.fastmcp import FastMCP
 from mcp.server.fastmcp.exceptions import ToolError
+from mcp.types import ToolAnnotations
+from pydantic import SecretStr
 
 # Multi-tenant (hosted) mode: each HTTP request's own Authorization header is
 # the key, so ONE deployed instance serves many users (the standard hosted-MCP
@@ -327,7 +330,39 @@ How to use it well:
 All content stays scoped to the configured collection unless you pass collection_id.
 """
 
+_fastmcp_server.Settings.model_rebuild(_types_namespace=vars(_fastmcp_server))
 mcp = FastMCP("hebbrix", instructions=INSTRUCTIONS, host=HOST, port=PORT)
+
+_READ_TOOL = ToolAnnotations(
+    readOnlyHint=True,
+    destructiveHint=False,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_WRITE_TOOL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=False,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+_DELETE_TOOL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=True,
+    openWorldHint=False,
+)
+_OVERWRITE_TOOL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=False,
+)
+_EXTERNAL_TOOL = ToolAnnotations(
+    readOnlyHint=False,
+    destructiveHint=True,
+    idempotentHint=False,
+    openWorldHint=True,
+)
 
 # Advertise the Hebbrix package version in the MCP handshake (serverInfo), not
 # the MCP SDK version. FastMCP leaves the lowlevel Server.version unset, which
@@ -1009,7 +1044,7 @@ def _append_missing_graph_facts(
 # --------------------------------------------------------------------------- #
 # Memory tools (CRUD + version history)                                        #
 # --------------------------------------------------------------------------- #
-@mcp.tool()
+@mcp.tool(annotations=_WRITE_TOOL)
 async def hebbrix_remember(
     content: str,
     tags: Optional[list[str]] = None,
@@ -1099,7 +1134,7 @@ async def hebbrix_remember(
                "graph_enrichment": "processing"})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_extraction_status(
     job_id: str,
     collection_id: Optional[str] = None,
@@ -1122,7 +1157,7 @@ async def hebbrix_extraction_status(
     return _u(out)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE_TOOL)
 async def hebbrix_remember_many(
     facts: list[str],
     collection_id: Optional[str] = None,
@@ -1183,7 +1218,7 @@ async def hebbrix_remember_many(
                "errors": data.get("errors")})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_search(
     query: str,
     limit: int = 5,
@@ -1331,7 +1366,7 @@ async def hebbrix_search(
     return _u(_fence_results(payload, "results"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_get(memory_id: str) -> dict[str, Any]:
     """Fetch one memory by id, including its full content and metadata."""
     # A memory deleted this session is gone — never fall back to a cached copy
@@ -1352,7 +1387,7 @@ async def hebbrix_get(memory_id: str) -> dict[str, Any]:
     return _u(_fence_results(_mem_row(data) | {"metadata": data.get("metadata")}, "content"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_OVERWRITE_TOOL)
 async def hebbrix_update(
     memory_id: str,
     content: Optional[str] = None,
@@ -1381,7 +1416,7 @@ async def hebbrix_update(
     return _u(_mem_row(data) | {"updated": True})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DELETE_TOOL)
 async def hebbrix_forget(memory_id: str) -> dict[str, Any]:
     """Delete a memory by id.
 
@@ -1410,7 +1445,7 @@ async def hebbrix_forget(memory_id: str) -> dict[str, Any]:
     return _u(result)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> dict[str, Any]:
     """List recent memories in a collection."""
     cid = _cid(collection_id)
@@ -1441,7 +1476,7 @@ async def hebbrix_list(limit: int = 20, collection_id: Optional[str] = None) -> 
     return _u(_fence_results({"count": len(rows[:limit]), "memories": rows[:limit]}, "memories"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_history(memory_id: str) -> dict[str, Any]:
     """Show the version history of a memory (how it changed over time, including
     supersessions). Useful to see what a fact used to be."""
@@ -1455,7 +1490,7 @@ async def hebbrix_history(memory_id: str) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # Knowledge-graph tools (the differentiator)                                   #
 # --------------------------------------------------------------------------- #
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_search_entities(
     entity_type: Optional[str] = None,
     limit: int = 20,
@@ -1479,7 +1514,7 @@ async def hebbrix_search_entities(
          "mentions": e.get("mention_count") or e.get("mentions")} for e in ents[:limit]]})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_entity_timeline(entity_name: str, collection_id: Optional[str] = None) -> dict[str, Any]:
     """Bi-temporal timeline for one entity: what facts were true about it and when.
     Use this for "what changed" / "what was true at time X" questions about a person,
@@ -1492,7 +1527,7 @@ async def hebbrix_entity_timeline(entity_name: str, collection_id: Optional[str]
                          {"collection_id": _cid(collection_id)})))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_graph_query(
     entity: str,
     relation_type: Optional[str] = None,
@@ -1515,7 +1550,7 @@ async def hebbrix_graph_query(
     return _u(_shape_graph(entity, data) if isinstance(data, dict) and "error" not in data else data)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_contradictions(
     memory_id: Optional[str] = None,
     collection_id: Optional[str] = None,
@@ -1530,7 +1565,7 @@ async def hebbrix_contradictions(
 # --------------------------------------------------------------------------- #
 # Reasoning layer (unique to Hebbrix: confidence + decision outcomes)          #
 # --------------------------------------------------------------------------- #
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) -> dict[str, Any]:
     """Ask how confident the agent should be before acting on something, grounded in
     stored memory and past decision outcomes. Call this before a consequential
@@ -1570,7 +1605,7 @@ async def hebbrix_confidence(query: str, collection_id: Optional[str] = None) ->
     return _u(out)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_ask(
     question: str,
     collection_id: Optional[str] = None,
@@ -1679,7 +1714,7 @@ async def hebbrix_ask(
     return _u(_fence_results(out, "citations", "graph", "profile"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE_TOOL)
 async def hebbrix_mark_used(
     memory_id: str,
     helpful: bool = True,
@@ -1699,7 +1734,7 @@ async def hebbrix_mark_used(
                "weakened": not helpful, "recorded": True})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE_TOOL)
 async def hebbrix_log_decision(
     description: Optional[str] = None,
     outcome: Optional[str] = None,
@@ -1746,7 +1781,7 @@ _LEARNING_KEY = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,99}$")
 _LEARNING_ACTION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}$")
 
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE_TOOL)
 async def hebbrix_choose_action(
     policy_key: str,
     actions: list[str],
@@ -1850,7 +1885,7 @@ async def hebbrix_choose_action(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_OVERWRITE_TOOL)
 async def hebbrix_report_outcome(
     decision_id: str,
     success: Optional[bool] = None,
@@ -1948,7 +1983,7 @@ async def hebbrix_report_outcome(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_learning_insights(
     policy_key: str,
     actions: Optional[list[str]] = None,
@@ -2002,7 +2037,7 @@ async def hebbrix_learning_insights(
     return _u(out)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_list_collections() -> dict[str, Any]:
     """List the collections (memory spaces / tenants) available to this API key."""
     data = await _get("/collections", {"limit": 100})
@@ -2013,7 +2048,7 @@ async def hebbrix_list_collections() -> dict[str, Any]:
         {"id": c.get("id"), "name": c.get("name"), "memory_count": c.get("memory_count")} for c in items]})
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_account_status() -> dict[str, Any]:
     """Tier, usage, limits, and expiry for this agent's account. In agent mode
     (auto-provisioned account), relay the claim command to the human when usage
@@ -2021,7 +2056,7 @@ async def hebbrix_account_status() -> dict[str, Any]:
     return _u(await _get("/agent-signup/whoami"))
 
 
-@mcp.tool()
+@mcp.tool(annotations=_EXTERNAL_TOOL)
 async def hebbrix_claim_start(email: str) -> dict[str, Any]:
     """Keep an accountless guest memory permanently by starting email claim.
 
@@ -2037,18 +2072,23 @@ async def hebbrix_claim_start(email: str) -> dict[str, Any]:
     return _u(data)
 
 
-@mcp.tool()
-async def hebbrix_claim_verify(code: str) -> dict[str, Any]:
+@mcp.tool(annotations=_WRITE_TOOL)
+async def hebbrix_claim_verify(code: SecretStr) -> dict[str, Any]:
     """Finish claiming a guest memory with the emailed six-digit code.
 
     Only call after ``hebbrix_claim_start`` and after the human supplies the
     code. On success the same memories remain available and guest expiry/caps
     are replaced by the normal claimed-account tier.
     """
-    code = str(code or "").strip()
-    if len(code) != 6 or not code.isdigit():
+    # SecretStr marks the generated tool schema as writeOnly/password so MCP
+    # hosts that honor secret schemas can redact it. The server never logs,
+    # echoes, returns, or attaches the supplied code to an error.
+    raw_code = (
+        code.get_secret_value() if isinstance(code, SecretStr) else str(code or "")
+    ).strip()
+    if len(raw_code) != 6 or not raw_code.isdigit():
         return _fail("the claim verification code must be exactly six digits")
-    data = await _post("/agent-signup/claim/verify", {"code": code})
+    data = await _post("/agent-signup/claim/verify", {"code": raw_code})
     return _u(data)
 
 
@@ -2074,7 +2114,7 @@ def _export_markdown(payload: dict) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_export(
     format: str = "json",
     collection_id: Optional[str] = None,
@@ -2123,7 +2163,7 @@ async def hebbrix_export(
             ents.append({"name": e.get("name"),
                          "type": e.get("type") or e.get("entity_type"),
                          "mentions": e.get("mention_count") or e.get("mentions")})
-    prof = await _get("/profile/facts")
+    prof = await _get("/profile/facts", {"collection_id": cid})
     prof = prof if isinstance(prof, dict) and "error" not in prof else None
     payload: dict[str, Any] = {
         "collection_id": cid,
@@ -2170,7 +2210,7 @@ def _import_facts(data: Any) -> list[str]:
     return [f.strip() for f in facts if f and f.strip()]
 
 
-@mcp.tool()
+@mcp.tool(annotations=_WRITE_TOOL)
 async def hebbrix_import(
     data: Any,
     collection_id: Optional[str] = None,

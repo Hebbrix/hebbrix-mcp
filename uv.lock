@@ -293,12 +293,13 @@ wheels = [
 
 [[package]]
 name = "hebbrix-mcp"
-version = "0.5.4"
+version = "0.5.5"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },
     { name = "httpx", extra = ["http2"] },
     { name = "mcp", extra = ["cli"] },
+    { name = "pydantic" },
 ]
 
 [package.optional-dependencies]
@@ -316,6 +317,7 @@ requires-dist = [
     { name = "cryptography", specifier = ">=42" },
     { name = "httpx", extras = ["http2"], specifier = ">=0.27" },
     { name = "mcp", extras = ["cli"], specifier = ">=1.0,<2" },
+    { name = "pydantic", specifier = ">=2.7" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },

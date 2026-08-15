@@ -7,11 +7,17 @@ Run: pytest tests/ -q
 import asyncio
 import json
 import os
+from importlib.metadata import version
 
 import pytest
 
 os.environ.setdefault("HEBBRIX_API_KEY", "mem_sk_test_dummy")
+import hebbrix_mcp  # noqa: E402
 from hebbrix_mcp import server as S  # noqa: E402
+
+
+def test_runtime_version_matches_distribution_metadata():
+    assert hebbrix_mcp.__version__ == version("hebbrix-mcp")
 
 
 class FakeResponse:
@@ -128,6 +134,16 @@ def test_all_tools_resources_prompts_registered():
         for expected in ("hebbrix_choose_action", "hebbrix_report_outcome",
                          "hebbrix_learning_insights"):
             assert expected in names
+        assert all(tool.annotations is not None for tool in tools)
+        by_name = {tool.name: tool for tool in tools}
+        assert by_name["hebbrix_search"].annotations.readOnlyHint is True
+        assert by_name["hebbrix_update"].annotations.destructiveHint is True
+        assert by_name["hebbrix_forget"].annotations.destructiveHint is True
+        assert by_name["hebbrix_report_outcome"].annotations.destructiveHint is True
+        assert by_name["hebbrix_claim_start"].annotations.openWorldHint is True
+        claim_code = by_name["hebbrix_claim_verify"].inputSchema["properties"]["code"]
+        assert claim_code["format"] == "password"
+        assert claim_code["writeOnly"] is True
         resources = await S.mcp.list_resources()
         assert [str(r.uri) for r in resources] == ["hebbrix://profile"]
         prompts = await S.mcp.list_prompts()
@@ -380,6 +396,8 @@ def test_export_json_bundles_memories_entities_profile(monkeypatch):
     assert out["memories"][0]["id"] == "m1"
     assert out["entities"] == [{"name": "atlas", "type": "object", "mentions": None}]
     assert out["profile"]["static"][0]["value"] == "pg"
+    profile_call = next(call for call in client.calls if "/profile/facts" in call[1])
+    assert profile_call[2]["params"] == {"collection_id": "c1"}
 
 
 def test_import_parses_list_dict_and_text(monkeypatch):

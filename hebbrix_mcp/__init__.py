@@ -1,6 +1,6 @@
 """Hebbrix MCP server — memory + knowledge graph tools for any MCP-compatible agent.
 
-Tool surface (25 tools + a profile resource + a context prompt):
+Tool surface (26 tools + a profile resource + a context prompt):
   Memory:  hebbrix_remember, hebbrix_search, hebbrix_get, hebbrix_update,
            hebbrix_forget, hebbrix_list, hebbrix_history
   Graph:   hebbrix_search_entities, hebbrix_entity_timeline,
@@ -27,5 +27,5 @@ Configure with env vars:
 """
 from .server import mcp, run
 
-__version__ = "0.5.3"
+__version__ = "0.5.5"
 __all__ = ["__version__", "mcp", "run"]
