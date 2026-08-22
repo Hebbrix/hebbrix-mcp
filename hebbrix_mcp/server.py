@@ -1218,6 +1218,85 @@ async def hebbrix_remember_many(
                "errors": data.get("errors")})
 
 
+def _authoritative_search_safety(data: Any) -> tuple[bool, str | None]:
+    """Validate the API-owned evidence envelope without re-grounding locally."""
+
+    if not isinstance(data, dict):
+        return False, "malformed_safety_envelope"
+    required = {
+        "no_match",
+        "abstain_recommended",
+        "query_confidence",
+        "grounding",
+        "evidence_ids",
+        "safety_contract_version",
+    }
+    if missing := sorted(required.difference(data)):
+        return False, f"missing_safety_fields:{','.join(missing)}"
+    if not isinstance(data.get("no_match"), bool) or not isinstance(
+        data.get("abstain_recommended"), bool
+    ):
+        return False, "invalid_abstention_fields"
+    confidence = data.get("query_confidence")
+    if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
+        return False, "invalid_query_confidence"
+    if not 0.0 <= float(confidence) <= 1.0:
+        return False, "invalid_query_confidence"
+    if not isinstance(data.get("grounding"), dict):
+        return False, "invalid_grounding_receipt"
+    if not isinstance(data.get("evidence_ids"), list):
+        return False, "invalid_evidence_ids"
+    result_ids = {
+        str(row.get("memory_id") or row.get("id"))
+        for row in (data.get("results") or [])
+        if isinstance(row, dict) and (row.get("memory_id") or row.get("id"))
+    }
+    evidence_ids = {str(value) for value in data.get("evidence_ids") if value}
+    if not result_ids.issubset(evidence_ids):
+        return False, "results_not_bound_to_evidence_ids"
+    if data.get("no_match") and (result_ids or evidence_ids):
+        return False, "no_match_contains_evidence"
+    return True, None
+
+
+def _fail_closed_search_payload(query: str, upstream: Any) -> dict[str, Any]:
+    error = upstream.get("error") if isinstance(upstream, dict) else None
+    payload = {
+        "query": query,
+        "count": 0,
+        "results": [],
+        "no_match": True,
+        "abstain_recommended": True,
+        "query_confidence": 0.0,
+        "grounding": {
+            "status": "no_grounded_match",
+            "reason": "upstream_search_unavailable",
+        },
+        "evidence_ids": [],
+        "evidence_claims": [],
+        "safety_contract_version": None,
+        "safety_reason": "upstream_search_unavailable",
+        "upstream_error": error,
+    }
+    if error:
+        payload["error"] = error
+    return payload
+
+
+def _authoritative_reason_safety(data: Any) -> tuple[bool, str | None]:
+    """Validate reasoning citations against the same API-owned evidence IDs."""
+
+    valid, reason = _authoritative_search_safety(
+        dict(data or {})
+        | {
+            "results": (data or {}).get("sources", [])
+            if isinstance(data, dict)
+            else []
+        }
+    )
+    return valid, reason
+
+
 @mcp.tool(annotations=_READ_TOOL)
 async def hebbrix_search(
     query: str,
@@ -1249,10 +1328,15 @@ async def hebbrix_search(
         search_body["threshold"] = min_score
     data = await _post("/search", search_body)
     if "error" in data:
-        return _u(data)
+        return _u(_fence_results(_fail_closed_search_payload(query, data), "results"))
     escalated_for_relevance = False
     suppressed_unverified = 0
-    if min_score == 0.0 and _uncalibrated_results_need_verification(query, data):
+    initial_safety_valid, _ = _authoritative_search_safety(data)
+    if (
+        min_score == 0.0
+        and not initial_safety_valid
+        and _uncalibrated_results_need_verification(query, data)
+    ):
         escalated_for_relevance = True
         unverified_count = len(data.get("results") or [])
         verified = await _post(
@@ -1275,15 +1359,36 @@ async def hebbrix_search(
         else:
             suppressed_unverified = unverified_count
             data = dict(data) | {"results": []}
-    # Reconcile remote results against this session's mutations so read-after-write
-    # holds for updates and deletes, not just creates:
-    #  - a tombstoned (deleted) id is dropped even if the remote index still has it
-    #  - a stale remote row is REPLACED by the corrected cached content (same id)
+    safety_valid, safety_reason = _authoritative_search_safety(data)
+    fail_closed = bool(
+        not safety_valid
+        or data.get("degraded") is True
+        or data.get("no_match") is True
+        or data.get("abstain_recommended") is True
+    )
+    authoritative_evidence = {
+        str(value) for value in (data.get("evidence_ids") or []) if value
+    }
+
+    # Reconcile remote results against authoritative API evidence. A local
+    # write-behind cache is useful for UX, but it has not crossed the API's
+    # grounding boundary and therefore must never be promoted into `results`.
     out: list[dict[str, Any]] = []
     seen: set = set()
-    for i in (data.get("results") or []):
+    for i in (() if fail_closed else (data.get("results") or [])):
         rid = i.get("memory_id")
+        if rid is None or str(rid) not in authoritative_evidence:
+            continue
         if rid is not None and _is_tombstoned(rid):
+            continue
+        cached = _cached_write(rid) if rid is not None else None
+        if (
+            cached
+            and cached.get("content") is not None
+            and cached["content"] != i.get("content")
+        ):
+            # The API row is stale relative to an in-session correction. Drop
+            # it from evidence and expose the replacement only as pending.
             continue
         # Drop pure-noise padding: the backend can pad results to `limit` with
         # zero-relevance rows, and an agent shouldn't treat those as recall. A
@@ -1302,35 +1407,14 @@ async def hebbrix_search(
         if "score_calibrated" in i:
             row["score_calibrated"] = bool(i.get("score_calibrated"))
         if rid is not None:
-            cw = _cached_write(rid)
-            # Only override + flag "corrected" when the cached content ACTUALLY
-            # differs from the remote row (a real in-session correction). A
-            # freshly-created, never-updated memory matches remote -> no flag.
-            if (cw and cw.get("content") is not None
-                    and cw["content"] != row["content"]):
-                row["content"] = cw["content"]
-                row["corrected"] = True
             seen.add(rid)
         out.append(row)
-    # Surface just-written/-corrected memories the remote index hasn't returned
-    # yet, at an overlap-scaled score (never a fake 1.0), then rank the whole set
-    # by score so a fresh local write interleaves honestly with real remote hits.
-    # A just-written memory the remote index hasn't caught up on is surfaced for
-    # read-after-write, but it must NOT outrank a genuinely-relevant indexed hit:
-    # cap each overlay strictly below the weakest real hit (recency breaks ties,
-    # it doesn't dominate). With no real hits, the overlay keeps its own score.
-    real_scores = [r["score"] for r in out]
-    cap = (min(real_scores) - 0.001) if real_scores else None
-    for w in _overlay_recent_writes(cid, seen, query=query):
-        _os = w.get("_overlay_score", 0.6)
-        if cap is not None:
-            _os = round(min(_os, cap), 3)
-        if _os < min_score or _os <= 0.0:
-            continue
-        out.append({"id": w["id"], "content": w["content"],
-                    "score": _os, "just_written": True})
     out.sort(key=lambda r: r.get("score") or 0.0, reverse=True)
     out = out[:limit]
+    pending_writes = [
+        {"id": w["id"], "content": w["content"], "status": "pending_grounding"}
+        for w in _overlay_recent_writes(cid, seen, query=query)
+    ][:limit]
     calibration_known = "scores_calibrated" in data
     calibrated = bool(data.get("scores_calibrated")) if calibration_known else None
     confidence: dict[str, Any] = {
@@ -1355,9 +1439,29 @@ async def hebbrix_search(
         "query": query,
         "count": len(out),
         "results": out,
+        "no_match": bool(fail_closed or data.get("no_match")),
+        "abstain_recommended": bool(
+            fail_closed or data.get("abstain_recommended")
+        ),
+        "query_confidence": 0.0 if fail_closed else data.get("query_confidence"),
+        "grounding": (
+            data.get("grounding")
+            if safety_valid
+            else {"status": "no_grounded_match", "reason": safety_reason}
+        ),
+        "evidence_ids": [] if fail_closed else [r["id"] for r in out],
+        "evidence_claims": [] if fail_closed else data.get("evidence_claims", []),
+        "safety_contract_version": data.get("safety_contract_version"),
+        "degraded": bool(data.get("degraded")),
         "processing_time_ms": data.get("processing_time_ms"),
         "retrieval_confidence": confidence,
     }
+    if pending_writes:
+        payload["pending_writes"] = pending_writes
+    if fail_closed:
+        payload["safety_reason"] = safety_reason or (
+            "degraded_search" if data.get("degraded") else "abstention_required"
+        )
     if calibrated is False and out:
         payload["warning"] = (
             "Scores are relative ranking values, not calibrated relevance "
@@ -1617,101 +1721,104 @@ async def hebbrix_ask(
     profile yourself. Use for questions like "who works with me on Atlas and what
     did we decide?".
 
-    Returns {"question", "answer", "citations":[{"id","content","score"}],
-    "graph"?, "profile"?}. `graph` (when include_graph) adds typed relationships
-    for entities named in the question; `profile` adds durable user facts. If the
-    reasoning backend is unavailable it falls back to raw search hits.
+    Returns {"question", "answer", "citations":[{"id","content","score"}]}
+    plus the same authoritative safety envelope as search. If reasoning or its
+    evidence receipt is unavailable, the tool fails closed with no citations.
     """
     cid = _cid(collection_id)
     if not cid:
         return _fail("no collection_id is available for this MCP session")
-    out: dict[str, Any] = {"question": question}
-    # 1) Synthesized answer + citations via the secure reasoning endpoint (it does
-    #    scoped hybrid retrieval + LLM + citations). Fall back to plain search so
-    #    the tool never hard-fails on quota/rate-limit.
+    del include_graph  # graph/profile data cannot bypass the reasoning receipt
     r = await _post("/search/reason", {"query": question, "collection_id": cid})
-    if isinstance(r, dict) and "error" not in r and r.get("answer"):
-        out["answer"] = r.get("answer")
-        out["citations"] = [
-            {"id": s.get("memory_id") or s.get("id"),
-             "content": (s.get("content") or "")[:240],
-             "score": round(s["score"], 3) if isinstance(s.get("score"), (int, float)) else s.get("score")}
-            for s in (r.get("sources") or [])]
-    else:
-        hits = await hebbrix_search(question, limit=5, collection_id=cid)
-        out["answer"] = None
-        out["citations"] = [{"id": h.get("id"), "content": h.get("content"),
-                             "score": h.get("score")}
-                            for h in (hits.get("results") or [])]
-        # Degrading to raw search must be LOUD and machine-readable. A generic
-        # "reasoning unavailable" reads like a transient blip, so an agent retries
-        # or silently accepts un-synthesized hits and the caller never learns the
-        # flagship layer is off. Distinguish an exhausted token budget (won't
-        # recover until the quota resets — stop retrying, tell the user) from a
-        # transient backend failure (retryable).
-        err = r.get("error") if isinstance(r, dict) else None
-        if _reasoning_quota_exhausted(r):
-            out["reasoning_disabled"] = "quota_exhausted"
-            out["note"] = (
-                f"{_QUOTA_NOTE} `answer` is null and `citations` are RAW SEARCH "
-                "HITS, not a synthesized answer.")
-        elif err:
-            out["reasoning_disabled"] = "unavailable"
-            out["note"] = ("reasoning backend unavailable; returning raw search "
-                           "hits instead of a synthesized answer (retryable)")
-        else:
-            out["reasoning_disabled"] = "no_answer"
-            out["note"] = "reasoning returned no answer; returning raw search hits"
-        if err:
-            out["reasoning_error"] = err
-    # 2) Graph enrichment: traverse from entities named in the question.
-    if include_graph:
-        try:
-            ents = await hebbrix_search_entities(limit=50, collection_id=cid)
-            ql = question.lower()
-            named = [e for e in (ents.get("entities") or [])
-                     if e.get("name") and str(e["name"]).lower() in ql][:2]
-            graph: list[dict[str, Any]] = []
-            for e in named:
-                g = await hebbrix_graph_query(str(e["name"]), depth=1, collection_id=cid)
-                for rel in (g.get("relationships") or [])[:8]:
-                    graph.append(rel)
-            if graph:
-                out["graph"] = graph
-                out["answer"], added = _append_missing_graph_facts(
-                    out.get("answer"), graph
-                )
-                if added:
-                    graph_citations = []
-                    for index, item in enumerate(added, start=1):
-                        graph_citations.append(
-                            {
-                                "citation": f"G{index}",
-                                "id": item.get("id"),
-                                "content": item.get("fact"),
-                                "score": item.get("score"),
-                                "source": "knowledge_graph",
-                            }
+    safety_valid, safety_reason = _authoritative_reason_safety(r)
+    fail_closed = bool(
+        not safety_valid
+        or not isinstance(r, dict)
+        or "error" in r
+        or not r.get("answer")
+        or r.get("degraded") is True
+        or r.get("no_match") is True
+        or r.get("abstain_recommended") is True
+    )
+    if fail_closed:
+        reason = safety_reason or (
+            "reasoning_quota_exhausted"
+            if _reasoning_quota_exhausted(r)
+            else "reasoning_unavailable_or_ungrounded"
+        )
+        disabled = (
+            "quota_exhausted"
+            if _reasoning_quota_exhausted(r)
+            else "unavailable"
+            if isinstance(r, dict) and r.get("error")
+            else "no_answer"
+        )
+        return _u(
+            _fence_results(
+                {
+                    "question": question,
+                    "answer": None,
+                    "citations": [],
+                    "no_match": True,
+                    "abstain_recommended": True,
+                    "query_confidence": 0.0,
+                    "grounding": {
+                        "status": "no_grounded_match",
+                        "reason": reason,
+                    },
+                    "evidence_ids": [],
+                    "evidence_claims": [],
+                    "safety_contract_version": (
+                        r.get("safety_contract_version")
+                        if isinstance(r, dict)
+                        else None
+                    ),
+                    "safety_reason": reason,
+                    "reasoning_disabled": disabled,
+                    "note": (
+                        (
+                            f"{_QUOTA_NOTE} Failed closed with no raw search citations."
+                            if disabled == "quota_exhausted"
+                            else "Reasoning is unavailable; failed closed with no raw "
+                            "search citations."
                         )
-                    citations = out.get("citations")
-                    if not isinstance(citations, list):
-                        citations = []
-                        out["citations"] = citations
-                    citations.extend(graph_citations)
-                    out["graph_facts_added_to_answer"] = len(added)
-        except Exception:
-            pass  # enrichment is best-effort, never fail the answer
-    # 3) Durable profile facts (the "about me" context).
-    prof = await _get("/profile/facts")
-    if isinstance(prof, dict) and "error" not in prof:
-        txt = _profile_text(prof)
-        if txt and txt != "(none yet)":
-            # The profile is compiled from saved memories and is the highest-risk
-            # injection surface (it rides every session). It is fenced on the
-            # resource/prompt paths; it must be fenced here too.
-            out["profile"] = _fence_untrusted(txt)
-    # `citations` and `graph` carry stored content verbatim — mark them untrusted.
-    return _u(_fence_results(out, "citations", "graph", "profile"))
+                    ),
+                },
+                "citations",
+            )
+        )
+
+    evidence_ids = {str(value) for value in r.get("evidence_ids", []) if value}
+    citations = []
+    for source in r.get("sources") or []:
+        source_id = source.get("memory_id") or source.get("id")
+        if not source_id or str(source_id) not in evidence_ids:
+            continue
+        citations.append(
+            {
+                "id": source_id,
+                "content": (source.get("content") or "")[:240],
+                "score": (
+                    round(source["score"], 3)
+                    if isinstance(source.get("score"), (int, float))
+                    else source.get("score")
+                ),
+            }
+        )
+    out = {
+        "question": question,
+        "answer": r.get("answer"),
+        "citations": citations,
+        "no_match": False,
+        "abstain_recommended": False,
+        "query_confidence": r.get("query_confidence"),
+        "grounding": r.get("grounding"),
+        "evidence_ids": [citation["id"] for citation in citations],
+        "evidence_claims": r.get("evidence_claims", []),
+        "safety_contract_version": r.get("safety_contract_version"),
+        "degraded": False,
+    }
+    return _u(_fence_results(out, "citations"))
 
 
 @mcp.tool(annotations=_WRITE_TOOL)
@@ -2319,7 +2426,7 @@ _UNTRUSTED_RESULT_NOTE = (
 )
 
 
-_FENCE_META_KEYS = {"_untrusted_data", "hebbrix_usage", "query", "count",
+_FENCE_META_KEYS = {"_untrusted_data", "_untrusted_data_notice", "hebbrix_usage", "query", "count",
                     "memory_id", "processing_time_ms", "question"}
 
 
@@ -2338,8 +2445,11 @@ def _fence_results(out: dict[str, Any], *keys: str) -> dict[str, Any]:
         carries = any(out.get(k) for k in keys)
     else:
         carries = any(v for k, v in out.items() if k not in _FENCE_META_KEYS)
-    if carries:
-        out.setdefault("_untrusted_data", _UNTRUSTED_RESULT_NOTE)
+    # The boolean is stable and machine-readable across empty/supported result
+    # sets; the explanatory text remains separate so clients never have to
+    # infer truthiness from a warning string.
+    out.setdefault("_untrusted_data", True)
+    out.setdefault("_untrusted_data_notice", _UNTRUSTED_RESULT_NOTE)
     return out
 
 

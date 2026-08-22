@@ -23,7 +23,12 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
-| 0.5.6 | Hebbrix API r96 / OpenAPI 1.0.0 | 26 | None from 0.5.5 |
+| 0.5.7 | Hebbrix API 1.0.0 / search-safety-v1 | 26 | None from 0.5.6 |
+
+Version 0.5.7 forwards the API-owned grounding and abstention envelope on
+search and reasoning tools. Missing, malformed, degraded, or ungrounded
+receipts fail closed with empty evidence; pending local writes remain clearly
+separate from verified results.
 
 The hosted server and PyPI package expose their exact package version during
 MCP initialization. The API exposes its immutable deployment build through
