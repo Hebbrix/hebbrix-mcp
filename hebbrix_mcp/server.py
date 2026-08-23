@@ -2433,18 +2433,14 @@ _FENCE_META_KEYS = {"_untrusted_data", "_untrusted_data_notice", "hebbrix_usage"
 def _fence_results(out: dict[str, Any], *keys: str) -> dict[str, Any]:
     """Attach the untrusted-data marker to a tool result that carries stored memory
     content. Non-destructive: content is returned verbatim (correct for a memory
-    store) and the marker rides alongside it. Emitted only when there is actually
-    stored content to warn about, so empty results cost no tokens.
+    store) and the marker rides alongside it. The marker is also present on empty
+    grounded results so clients can enforce one stable fail-closed envelope.
 
-    Pass explicit `keys` when the payload shape is known; with no keys the payload
-    is fenced when it carries any non-metadata value (used for backend responses
-    we pass through without reshaping, e.g. contradictions/timeline)."""
+    ``keys`` remains accepted for call-site compatibility with known payload
+    shapes; fencing itself is intentionally unconditional for every successful
+    retrieval response."""
     if not isinstance(out, dict) or "error" in out:
         return out
-    if keys:
-        carries = any(out.get(k) for k in keys)
-    else:
-        carries = any(v for k, v in out.items() if k not in _FENCE_META_KEYS)
     # The boolean is stable and machine-readable across empty/supported result
     # sets; the explanatory text remains separate so clients never have to
     # infer truthiness from a warning string.

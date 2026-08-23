@@ -81,3 +81,9 @@ include = [
 # Keep CI's long-standing correctness-focused baseline stable across Ruff
 # releases; new Ruff versions must not silently enable every style/plugin rule.
 select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+# pytest-asyncio is changing its implicit default. Pin the intended scope so
+# release validation remains warning-free and cannot change behavior when the
+# dependency advances.
+asyncio_default_fixture_loop_scope = "function"
