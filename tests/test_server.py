@@ -182,7 +182,7 @@ def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 26
+        assert len(tools) == 32
         names = {t.name for t in tools}
         assert "hebbrix_extraction_status" in names
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
@@ -194,7 +194,10 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_account_status", "hebbrix_export",
                          "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used",
                          "hebbrix_import", "hebbrix_claim_start",
-                         "hebbrix_claim_verify"):
+                         "hebbrix_claim_verify", "hebbrix_create_procedure",
+                         "hebbrix_list_procedures", "hebbrix_get_procedure",
+                         "hebbrix_update_procedure", "hebbrix_execute_procedure",
+                         "hebbrix_delete_procedure"):
             assert expected in names
         for expected in ("hebbrix_choose_action", "hebbrix_report_outcome",
                          "hebbrix_learning_insights"):
@@ -204,6 +207,8 @@ def test_all_tools_resources_prompts_registered():
         assert by_name["hebbrix_search"].annotations.readOnlyHint is True
         assert by_name["hebbrix_update"].annotations.destructiveHint is True
         assert by_name["hebbrix_forget"].annotations.destructiveHint is True
+        assert by_name["hebbrix_delete_procedure"].annotations.destructiveHint is True
+        assert by_name["hebbrix_list_procedures"].annotations.readOnlyHint is True
         assert by_name["hebbrix_report_outcome"].annotations.destructiveHint is True
         assert by_name["hebbrix_claim_start"].annotations.openWorldHint is True
         claim_code = by_name["hebbrix_claim_verify"].inputSchema["properties"]["code"]
@@ -510,6 +515,77 @@ def test_remember_many_posts_batch(monkeypatch):
     method, url, kw = client.calls[-1]
     assert method == "POST" and url.endswith("/memories/batch")
     assert len(kw["json"]["memories"]) == 2
+
+
+def test_remember_many_preserves_authoritative_readiness_receipt(monkeypatch):
+    _fake(monkeypatch, FakeResponse(202, {
+        "created": 2,
+        "failed": 0,
+        "memory_ids": ["m1", "m2"],
+        "processing_status": "processing",
+        "searchable": False,
+        "outbox_event_id": "event-1",
+        "status_url": "/v1/memories/m1",
+    }))
+    out = asyncio.run(S.hebbrix_remember_many(["one", "two"], collection_id="c1"))
+    assert out["processing_status"] == "processing"
+    assert out["searchable"] is False
+    assert out["outbox_event_id"] == "event-1"
+    assert out["status_url"] == "/v1/memories/m1"
+
+
+def test_procedure_lifecycle_uses_canonical_api_contract(monkeypatch):
+    class ProcedureClient(FakeClient):
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            if url.endswith("/procedures"):
+                return FakeResponse(200, {"procedure_id": "procedure-1"})
+            return FakeResponse(200, {"execution_result": {"output": "recovered"}})
+
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if url.endswith("/procedures"):
+                return FakeResponse(200, {"procedures": [{"id": "procedure-1"}]})
+            return FakeResponse(200, {"procedure": {"id": "procedure-1"}})
+
+        async def patch(self, url, **kw):
+            self.calls.append(("PATCH", url, kw))
+            return FakeResponse(200, {"procedure": {"id": "procedure-1", "name": "updated"}})
+
+        async def delete(self, url, **kw):
+            self.calls.append(("DELETE", url, kw))
+            return FakeResponse(204)
+
+    client = ProcedureClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+
+    created = asyncio.run(S.hebbrix_create_procedure(
+        "recover proxy",
+        {"expression": "proxy unavailable"},
+        {"steps": ["recycle once"]},
+        collection_id="collection-1",
+    ))
+    listed = asyncio.run(S.hebbrix_list_procedures(collection_id="collection-1"))
+    fetched = asyncio.run(S.hebbrix_get_procedure("procedure-1"))
+    updated = asyncio.run(S.hebbrix_update_procedure("procedure-1", name="updated"))
+    executed = asyncio.run(S.hebbrix_execute_procedure("procedure-1", {"incident": "INC-1"}))
+    deleted = asyncio.run(S.hebbrix_delete_procedure("procedure-1"))
+
+    assert created["id"] == "procedure-1"
+    assert listed["procedures"][0]["id"] == "procedure-1"
+    assert fetched["id"] == "procedure-1"
+    assert updated["name"] == "updated"
+    assert executed == {"output": "recovered"}
+    assert deleted == {"status": 204, "ok": True, "deleted": True,
+                       "procedure_id": "procedure-1"}
+    assert [(method, url.rsplit("/v1", 1)[-1]) for method, url, _ in client.calls] == [
+        ("POST", "/procedures"),
+        ("GET", "/procedures"),
+        ("GET", "/procedures/procedure-1"),
+        ("PATCH", "/procedures/procedure-1"),
+        ("POST", "/procedures/procedure-1/execute"),
+        ("DELETE", "/procedures/procedure-1"),
+    ]
 
 
 def test_remember_many_falls_back_on_tier_gate(monkeypatch):

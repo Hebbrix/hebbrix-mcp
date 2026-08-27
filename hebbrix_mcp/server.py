@@ -1215,7 +1215,147 @@ async def hebbrix_remember_many(
     return _u({"created": data.get("created", len(mem_ids)),
                "failed": data.get("failed", 0),
                "memory_ids": mem_ids,
-               "errors": data.get("errors")})
+               "errors": data.get("errors"),
+               "processing_status": data.get("processing_status"),
+               "searchable": data.get("searchable"),
+               "outbox_event_id": data.get("outbox_event_id"),
+               "status_url": data.get("status_url")})
+
+
+# --------------------------------------------------------------------------- #
+# Procedural memory tools                                                      #
+# --------------------------------------------------------------------------- #
+def _procedure_payload(data: Any) -> Any:
+    if not isinstance(data, dict):
+        return data
+    procedure = data.get("procedure")
+    if isinstance(procedure, dict):
+        return procedure
+    if data.get("procedure_id") and not data.get("id"):
+        return data | {"id": data["procedure_id"]}
+    return data
+
+
+@mcp.tool(annotations=_WRITE_TOOL)
+async def hebbrix_create_procedure(
+    name: str,
+    condition: dict[str, Any],
+    action: dict[str, Any],
+    description: Optional[str] = None,
+    category: Optional[str] = None,
+    collection_id: Optional[str] = None,
+    parameters: Optional[dict[str, Any]] = None,
+    user_id: Optional[str] = None,
+    agent_id: Optional[str] = None,
+    run_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create a tenant-scoped learned procedure using canonical API fields."""
+    cid = _cid(collection_id)
+    data = await _post("/procedures", {
+        "name": name,
+        "condition": condition,
+        "action": action,
+        "description": description,
+        "category": category,
+        "collection_id": cid,
+        "parameters": parameters,
+        "user_id": user_id,
+        "agent_id": agent_id,
+        "run_id": run_id,
+    })
+    if isinstance(data, dict) and "error" in data:
+        return _u(data)
+    return _u(_procedure_payload(data))
+
+
+@mcp.tool(annotations=_READ_TOOL)
+async def hebbrix_list_procedures(
+    collection_id: Optional[str] = None,
+    category: Optional[str] = None,
+    active_only: bool = True,
+    skip: int = 0,
+    limit: int = 100,
+) -> dict[str, Any]:
+    """List learned procedures owned by the current tenant."""
+    data = await _get("/procedures", {
+        "collection_id": _cid(collection_id),
+        "category": category,
+        "active_only": active_only,
+        "skip": max(0, int(skip)),
+        "limit": max(1, min(int(limit), 100)),
+    })
+    return _u(data) if isinstance(data, dict) else _u({"procedures": data})
+
+
+@mcp.tool(annotations=_READ_TOOL)
+async def hebbrix_get_procedure(procedure_id: str) -> dict[str, Any]:
+    """Get one tenant-owned procedure by id."""
+    data = await _get(f"/procedures/{_path_segment(procedure_id)}")
+    if isinstance(data, dict) and "error" in data:
+        return _u(data)
+    return _u(_procedure_payload(data))
+
+
+@mcp.tool(annotations=_OVERWRITE_TOOL)
+async def hebbrix_update_procedure(
+    procedure_id: str,
+    name: Optional[str] = None,
+    condition: Optional[dict[str, Any]] = None,
+    action: Optional[dict[str, Any]] = None,
+    description: Optional[str] = None,
+    category: Optional[str] = None,
+    parameters: Optional[dict[str, Any]] = None,
+    is_active: Optional[bool] = None,
+) -> dict[str, Any]:
+    """Update mutable fields on one tenant-owned procedure; scope is immutable."""
+    changes = {
+        "name": name,
+        "condition": condition,
+        "action": action,
+        "description": description,
+        "category": category,
+        "parameters": parameters,
+        "is_active": is_active,
+    }
+    if not any(value is not None for value in changes.values()):
+        return _fail("pass at least one mutable procedure field")
+    data = await _patch(
+        f"/procedures/{_path_segment(procedure_id)}",
+        changes,
+    )
+    if isinstance(data, dict) and "error" in data:
+        return _u(data)
+    return _u(_procedure_payload(data))
+
+
+@mcp.tool(annotations=_WRITE_TOOL)
+async def hebbrix_execute_procedure(
+    procedure_id: str,
+    input_state: Optional[dict[str, Any]] = None,
+    parameters: Optional[dict[str, Any]] = None,
+) -> dict[str, Any]:
+    """Execute one tenant-owned procedure and record its execution."""
+    data = await _post(
+        f"/procedures/{_path_segment(procedure_id)}/execute",
+        {"input_state": input_state or {}, "parameters": parameters},
+    )
+    if isinstance(data, dict) and "error" in data:
+        return _u(data)
+    result = data.get("execution_result") if isinstance(data, dict) else data
+    return _u(result if isinstance(result, dict) else {"execution_result": result})
+
+
+@mcp.tool(annotations=_DELETE_TOOL)
+async def hebbrix_delete_procedure(procedure_id: str) -> dict[str, Any]:
+    """Idempotently delete a tenant-owned procedure and its executions.
+
+    The API returns the same 204 for deleted, absent, and foreign-tenant ids so
+    this destructive tool cannot disclose another tenant's procedure identity.
+    """
+    data = await _delete(f"/procedures/{_path_segment(procedure_id)}")
+    if data.get("ok"):
+        data.update({"deleted": True, "procedure_id": str(procedure_id)})
+    return _u(data)
 
 
 def _authoritative_search_safety(data: Any) -> tuple[bool, str | None]:

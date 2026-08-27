@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.5.8 — 2026-08-27
+
+- Added create/list/get/update/execute/delete tools for the canonical
+  `/v1/procedures` lifecycle, with explicit tenant scope and destructive safety
+  annotations.
+- Preserved batch `processing_status`, `searchable`, outbox event, and status URL
+  so asynchronous MCP writes never imply query readiness.
+- Aligned idempotent procedure deletion with REST, OpenAPI, Python, and
+  TypeScript: a successful tool call represents the API's non-oracular 204.
+
 ## 0.5.6 — 2026-08-15
 
 - Declared compatibility with the August 15, 2026 Hebbrix API r96 contract:
