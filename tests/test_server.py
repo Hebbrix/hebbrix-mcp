@@ -24,6 +24,71 @@ class FakeResponse:
     def __init__(self, status_code=200, payload=None, headers=None, text=""):
         self.status_code = status_code
         self._payload = payload if payload is not None else {}
+        # Most tests model a current API response. Add the canonical safety
+        # receipt so individual reshaping tests stay focused on their concern;
+        # malformed-envelope tests use a custom response or monkeypatch _post.
+        if status_code < 400 and isinstance(self._payload, dict):
+            rows = self._payload.get("results")
+            if isinstance(rows, list) and (
+                not rows
+                or any(
+                    isinstance(row, dict)
+                    and ("memory_id" in row or "score" in row)
+                    for row in rows
+                )
+            ):
+                ids = [
+                    str(row.get("memory_id") or row.get("id"))
+                    for row in rows
+                    if isinstance(row, dict)
+                    and (row.get("memory_id") or row.get("id"))
+                ]
+                positive = any(
+                    isinstance(row, dict) and float(row.get("score") or 0.0) > 0.0
+                    for row in rows
+                )
+                self._payload.setdefault("no_match", not positive)
+                self._payload.setdefault("abstain_recommended", not positive)
+                self._payload.setdefault(
+                    "query_confidence",
+                    max(
+                        (
+                            float(row.get("normalized_score") or row.get("score") or 0.0)
+                            for row in rows
+                            if isinstance(row, dict)
+                        ),
+                        default=0.0,
+                    ),
+                )
+                self._payload.setdefault(
+                    "grounding",
+                    {"status": "supported" if ids else "no_grounded_match"},
+                )
+                self._payload.setdefault("evidence_ids", ids)
+                self._payload.setdefault("evidence_claims", [])
+                self._payload.setdefault(
+                    "safety_contract_version", "search-safety-v1"
+                )
+            sources = self._payload.get("sources")
+            if "answer" in self._payload and isinstance(sources, list):
+                ids = [
+                    str(source.get("memory_id") or source.get("id"))
+                    for source in sources
+                    if isinstance(source, dict)
+                    and (source.get("memory_id") or source.get("id"))
+                ]
+                self._payload.setdefault("no_match", not bool(ids))
+                self._payload.setdefault("abstain_recommended", not bool(ids))
+                self._payload.setdefault("query_confidence", 0.9 if ids else 0.0)
+                self._payload.setdefault(
+                    "grounding",
+                    {"status": "supported" if ids else "no_grounded_match"},
+                )
+                self._payload.setdefault("evidence_ids", ids)
+                self._payload.setdefault("evidence_claims", [])
+                self._payload.setdefault(
+                    "safety_contract_version", "search-safety-v1"
+                )
         self.headers = {k.lower(): v for k, v in (headers or {}).items()}
         self.text = text or json.dumps(self._payload)
 
@@ -117,7 +182,7 @@ def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 26
+        assert len(tools) == 32
         names = {t.name for t in tools}
         assert "hebbrix_extraction_status" in names
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
@@ -129,7 +194,10 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_account_status", "hebbrix_export",
                          "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used",
                          "hebbrix_import", "hebbrix_claim_start",
-                         "hebbrix_claim_verify"):
+                         "hebbrix_claim_verify", "hebbrix_create_procedure",
+                         "hebbrix_list_procedures", "hebbrix_get_procedure",
+                         "hebbrix_update_procedure", "hebbrix_execute_procedure",
+                         "hebbrix_delete_procedure"):
             assert expected in names
         for expected in ("hebbrix_choose_action", "hebbrix_report_outcome",
                          "hebbrix_learning_insights"):
@@ -139,6 +207,8 @@ def test_all_tools_resources_prompts_registered():
         assert by_name["hebbrix_search"].annotations.readOnlyHint is True
         assert by_name["hebbrix_update"].annotations.destructiveHint is True
         assert by_name["hebbrix_forget"].annotations.destructiveHint is True
+        assert by_name["hebbrix_delete_procedure"].annotations.destructiveHint is True
+        assert by_name["hebbrix_list_procedures"].annotations.readOnlyHint is True
         assert by_name["hebbrix_report_outcome"].annotations.destructiveHint is True
         assert by_name["hebbrix_claim_start"].annotations.openWorldHint is True
         claim_code = by_name["hebbrix_claim_verify"].inputSchema["properties"]["code"]
@@ -447,6 +517,77 @@ def test_remember_many_posts_batch(monkeypatch):
     assert len(kw["json"]["memories"]) == 2
 
 
+def test_remember_many_preserves_authoritative_readiness_receipt(monkeypatch):
+    _fake(monkeypatch, FakeResponse(202, {
+        "created": 2,
+        "failed": 0,
+        "memory_ids": ["m1", "m2"],
+        "processing_status": "processing",
+        "searchable": False,
+        "outbox_event_id": "event-1",
+        "status_url": "/v1/memories/m1",
+    }))
+    out = asyncio.run(S.hebbrix_remember_many(["one", "two"], collection_id="c1"))
+    assert out["processing_status"] == "processing"
+    assert out["searchable"] is False
+    assert out["outbox_event_id"] == "event-1"
+    assert out["status_url"] == "/v1/memories/m1"
+
+
+def test_procedure_lifecycle_uses_canonical_api_contract(monkeypatch):
+    class ProcedureClient(FakeClient):
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            if url.endswith("/procedures"):
+                return FakeResponse(200, {"procedure_id": "procedure-1"})
+            return FakeResponse(200, {"execution_result": {"output": "recovered"}})
+
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if url.endswith("/procedures"):
+                return FakeResponse(200, {"procedures": [{"id": "procedure-1"}]})
+            return FakeResponse(200, {"procedure": {"id": "procedure-1"}})
+
+        async def patch(self, url, **kw):
+            self.calls.append(("PATCH", url, kw))
+            return FakeResponse(200, {"procedure": {"id": "procedure-1", "name": "updated"}})
+
+        async def delete(self, url, **kw):
+            self.calls.append(("DELETE", url, kw))
+            return FakeResponse(204)
+
+    client = ProcedureClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+
+    created = asyncio.run(S.hebbrix_create_procedure(
+        "recover proxy",
+        {"expression": "proxy unavailable"},
+        {"steps": ["recycle once"]},
+        collection_id="collection-1",
+    ))
+    listed = asyncio.run(S.hebbrix_list_procedures(collection_id="collection-1"))
+    fetched = asyncio.run(S.hebbrix_get_procedure("procedure-1"))
+    updated = asyncio.run(S.hebbrix_update_procedure("procedure-1", name="updated"))
+    executed = asyncio.run(S.hebbrix_execute_procedure("procedure-1", {"incident": "INC-1"}))
+    deleted = asyncio.run(S.hebbrix_delete_procedure("procedure-1"))
+
+    assert created["id"] == "procedure-1"
+    assert listed["procedures"][0]["id"] == "procedure-1"
+    assert fetched["id"] == "procedure-1"
+    assert updated["name"] == "updated"
+    assert executed == {"output": "recovered"}
+    assert deleted == {"status": 204, "ok": True, "deleted": True,
+                       "procedure_id": "procedure-1"}
+    assert [(method, url.rsplit("/v1", 1)[-1]) for method, url, _ in client.calls] == [
+        ("POST", "/procedures"),
+        ("GET", "/procedures"),
+        ("GET", "/procedures/procedure-1"),
+        ("PATCH", "/procedures/procedure-1"),
+        ("POST", "/procedures/procedure-1/execute"),
+        ("DELETE", "/procedures/procedure-1"),
+    ]
+
+
 def test_remember_many_falls_back_on_tier_gate(monkeypatch):
     # /memories/batch is Starter+; a 403 must degrade to sequential raw writes.
     class TierClient(FakeClient):
@@ -490,7 +631,7 @@ def test_ask_uses_reason_and_cites(monkeypatch):
     assert out["citations"] == [{"id": "m1", "content": "Sarah works on Atlas", "score": 0.9}]
 
 
-def test_ask_merges_missing_scoped_graph_facts_into_answer(monkeypatch):
+def test_ask_does_not_use_unreceipted_graph_facts_to_bypass_abstention(monkeypatch):
     class GraphAskClient(FakeClient):
         async def post(self, url, **kw):
             self.calls.append(("POST", url, kw))
@@ -534,19 +675,10 @@ def test_ask_merges_missing_scoped_graph_facts_into_answer(monkeypatch):
         collection_id="c1",
     ))
 
-    assert "Mira manages Project Orion" in out["answer"]
-    assert "Project Orion uses TimescaleDB" in out["answer"]
-    assert "Project Lyra" not in out["answer"]
-    assert out["graph_facts_added_to_answer"] == 2
-    assert "[G1]" in out["answer"] and "[G2]" in out["answer"]
-    assert [row["source"] for row in out["citations"]] == [
-        "knowledge_graph",
-        "knowledge_graph",
-    ]
-    assert {row["id"] for row in out["citations"]} == {
-        "m-manager",
-        "m-database",
-    }
+    assert out["answer"] is None
+    assert out["citations"] == []
+    assert out["abstain_recommended"] is True
+    assert out["evidence_ids"] == []
 
 
 def test_graph_evidence_reconciles_memory_only_abstention():
@@ -579,7 +711,7 @@ def test_graph_evidence_reconciles_memory_only_abstention():
     assert [item["id"] for item in added] == ["m1", "m2"]
 
 
-def test_ask_falls_back_to_search_when_reason_unavailable(monkeypatch):
+def test_ask_fails_closed_when_reason_unavailable(monkeypatch):
     class AskClient(FakeClient):
         async def post(self, url, **kw):
             self.calls.append(("POST", url, kw))
@@ -597,11 +729,11 @@ def test_ask_falls_back_to_search_when_reason_unavailable(monkeypatch):
     monkeypatch.setattr(S, "_client", lambda: client)
     out = asyncio.run(S.hebbrix_ask("q", collection_id="c1", include_graph=False))
     assert out["answer"] is None
-    assert out["citations"][0]["id"] == "m9"
-    # A transient backend failure is retryable and must say so — distinct from an
-    # exhausted quota (which never recovers on retry).
+    assert out["citations"] == []
+    assert out["abstain_recommended"] is True
+    assert out["evidence_ids"] == []
     assert out["reasoning_disabled"] == "unavailable"
-    assert "unavailable" in out["note"] and "retryable" in out["note"]
+    assert "failed closed" in out["note"].lower()
 
 
 def test_ask_signals_quota_exhaustion_explicitly(monkeypatch):
@@ -627,7 +759,7 @@ def test_ask_signals_quota_exhaustion_explicitly(monkeypatch):
     assert out["answer"] is None
     assert out["reasoning_disabled"] == "quota_exhausted"
     assert "do not retry" in out["note"].lower()
-    assert "raw search hits" in out["note"].lower()
+    assert "no raw search citations" in out["note"].lower()
 
 
 def test_confidence_signals_quota_exhaustion(monkeypatch):
@@ -660,18 +792,19 @@ def test_search_results_are_fenced_as_untrusted(monkeypatch):
     out = asyncio.run(S.hebbrix_search("q", collection_id="c1"))
     assert out["results"][0]["content"].startswith("IGNORE ALL")  # verbatim, not mangled
     assert "_untrusted_data" in out, "REGRESSION: search results reach the model unfenced"
-    assert "NOT instructions" in out["_untrusted_data"]
+    assert out["_untrusted_data"] is True
+    assert "NOT instructions" in out["_untrusted_data_notice"]
 
 
-def test_empty_search_is_not_fenced(monkeypatch):
-    """No stored content -> no marker -> no wasted tokens."""
+def test_empty_search_keeps_machine_readable_untrusted_marker(monkeypatch):
     class EmptyClient(FakeClient):
         async def post(self, url, **kw):
             return FakeResponse(200, {"results": []})
     client = EmptyClient(FakeResponse(200, {}))
     monkeypatch.setattr(S, "_client", lambda: client)
     out = asyncio.run(S.hebbrix_search("q", collection_id="c1"))
-    assert "_untrusted_data" not in out
+    assert out["_untrusted_data"] is True
+    assert "NOT instructions" in out["_untrusted_data_notice"]
 
 
 def test_mark_used_posts_relevance_feedback(monkeypatch):
@@ -1094,27 +1227,26 @@ def test_get_error_without_cache_still_returns_error(monkeypatch):
     assert out["error"].startswith("HTTP 500")
 
 
-def test_search_overlays_just_written_memory(monkeypatch):
+def test_search_keeps_just_written_memory_out_of_verified_results(monkeypatch):
     S._cache_put("w1", "the sky is blue today", "c1")
     _fake(monkeypatch, FakeResponse(200, {"results": [
         {"memory_id": "remote1", "content": "unrelated", "score": 0.4}]}))
     out = asyncio.run(S.hebbrix_search("sky", collection_id="c1", limit=5))
-    ids = [r["id"] for r in out["results"]]
-    assert "w1" in ids
-    top = next(r for r in out["results"] if r["id"] == "w1")
-    assert top["just_written"] is True
+    assert [r["id"] for r in out["results"]] == ["remote1"]
+    assert out["evidence_ids"] == ["remote1"]
+    assert out["pending_writes"] == [
+        {"id": "w1", "content": "the sky is blue today", "status": "pending_grounding"}
+    ]
 
 
-def test_overlay_capped_below_real_hits(monkeypatch):
-    # A just-written memory must not outrank a genuinely-relevant indexed hit.
+def test_pending_write_never_competes_with_authoritative_evidence(monkeypatch):
     S._cache_put("w1", "the sky is blue today", "c1")
     _fake(monkeypatch, FakeResponse(200, {"results": [
         {"memory_id": "remote1", "content": "sky facts", "score": 0.4}]}))
     out = asyncio.run(S.hebbrix_search("sky", collection_id="c1", limit=5))
-    w1 = next(r for r in out["results"] if r["id"] == "w1")
-    remote = next(r for r in out["results"] if r["id"] == "remote1")
-    assert w1["score"] < remote["score"]          # capped below the real hit
-    assert out["results"][0]["id"] == "remote1"    # real hit ranks first
+    assert out["results"][0]["id"] == "remote1"
+    assert all(row["id"] != "w1" for row in out["results"])
+    assert out["pending_writes"][0]["id"] == "w1"
 
 
 def test_overlay_shared_verb_only_is_not_a_match(monkeypatch):
@@ -1382,7 +1514,7 @@ def test_hosted_validation_failure_raises_real_tool_error(monkeypatch):
 # ============================================================================
 
 # --- #1 update: search returns corrected content, not stale remote ----------
-def test_update_refreshes_cache_search_returns_corrected(monkeypatch):
+def test_update_suppresses_stale_remote_until_correction_is_grounded(monkeypatch):
     # hebbrix_update m1 -> Borealis (PATCH response carries collection_id)
     _fake(monkeypatch, FakeResponse(200, {"id": "m1", "collection_id": "c1"}))
     up = asyncio.run(S.hebbrix_update("m1", content="the codename is Borealis"))
@@ -1391,10 +1523,12 @@ def test_update_refreshes_cache_search_returns_corrected(monkeypatch):
     _fake(monkeypatch, FakeResponse(200, {"results": [
         {"memory_id": "m1", "content": "the codename is Aurora", "score": 0.9}]}))
     out = asyncio.run(S.hebbrix_search("codename", collection_id="c1"))
-    row = next(r for r in out["results"] if r["id"] == "m1")
-    assert row["content"] == "the codename is Borealis"   # cached correction wins
-    assert row.get("corrected") is True
-    assert "Aurora" not in row["content"]
+    assert out["results"] == []
+    assert out["pending_writes"][0] == {
+        "id": "m1",
+        "content": "the codename is Borealis",
+        "status": "pending_grounding",
+    }
 
 
 def test_update_sends_wait_for_index(monkeypatch):
@@ -1404,13 +1538,14 @@ def test_update_sends_wait_for_index(monkeypatch):
 
 
 # --- #2 update: remote omits the id -> overlay supplies corrected content ----
-def test_update_then_search_overlays_when_remote_omits(monkeypatch):
+def test_update_then_search_reports_pending_when_remote_omits(monkeypatch):
     _fake(monkeypatch, FakeResponse(200, {"id": "m1", "collection_id": "c1"}))
     asyncio.run(S.hebbrix_update("m1", content="borealis is the codename"))
     _fake(monkeypatch, FakeResponse(200, {"results": []}))  # remote not indexed yet
     out = asyncio.run(S.hebbrix_search("borealis", collection_id="c1"))
-    m1 = next(r for r in out["results"] if r["id"] == "m1")
-    assert m1["content"] == "borealis is the codename" and m1.get("just_written") is True
+    assert out["results"] == []
+    assert out["pending_writes"][0]["id"] == "m1"
+    assert out["pending_writes"][0]["status"] == "pending_grounding"
 
 
 # --- #3 delete: search omits it -> stays absent (no overlay resurrection) -----
@@ -1567,14 +1702,13 @@ def test_overlay_does_not_inject_on_stopword_only_overlap(monkeypatch):
     assert all(r["id"] != "w1" for r in out["results"])   # "the" is not a match
 
 
-def test_overlay_injects_on_content_word_below_score_one(monkeypatch):
+def test_content_overlap_does_not_promote_pending_write_to_evidence(monkeypatch):
     S._cache_put("w1", "the deployment schedule is Friday at noon", "c1")
     _fake(monkeypatch, FakeResponse(200, {"results": []}))
     out = asyncio.run(S.hebbrix_search("deployment schedule", collection_id="c1"))
-    w1 = next(r for r in out["results"] if r["id"] == "w1")
-    assert w1["just_written"] is True
-    assert w1["score"] < 1.0        # never a fake perfect match
-    assert w1["score"] >= 0.5
+    assert out["results"] == []
+    assert out["evidence_ids"] == []
+    assert out["pending_writes"][0]["id"] == "w1"
 
 
 def test_overlay_never_outranks_a_stronger_remote_hit(monkeypatch):
@@ -1596,13 +1730,13 @@ def test_freshly_created_memory_is_not_flagged_corrected(monkeypatch):
     assert "corrected" not in m1        # never updated -> not corrected
 
 
-def test_actually_corrected_memory_is_flagged(monkeypatch):
+def test_actually_corrected_memory_is_pending_not_relabelled_as_evidence(monkeypatch):
     S._cache_put("m1", "Widget pricing is public.", "c1")   # in-session correction
     _fake(monkeypatch, FakeResponse(200, {"results": [
         {"memory_id": "m1", "content": "Widget pricing is confidential.", "score": 0.99}]}))
     out = asyncio.run(S.hebbrix_search("widget pricing", collection_id="c1"))
-    m1 = next(r for r in out["results"] if r["id"] == "m1")
-    assert m1.get("corrected") is True and m1["content"] == "Widget pricing is public."
+    assert out["results"] == []
+    assert out["pending_writes"][0]["content"] == "Widget pricing is public."
 
 
 # ============ profile durable/recent separation + zero-relevance (v0.3.13) ===
@@ -1691,6 +1825,12 @@ def test_search_calibration_preserves_semantic_paraphrase(monkeypatch):
             "scores_calibrated": True,
             "reranker_applied": True,
             "query_confidence": 0.91,
+            "no_match": False,
+            "abstain_recommended": False,
+            "grounding": {"status": "supported"},
+            "evidence_ids": ["candidate"],
+            "evidence_claims": [],
+            "safety_contract_version": "search-safety-v1",
             "results": [{
                 "memory_id": "candidate",
                 "content": "Mochi is a Golden Retriever.",
@@ -1750,7 +1890,7 @@ def test_search_suppresses_thresholded_rows_when_api_cannot_calibrate(monkeypatc
     assert out["retrieval_confidence"]["suppressed_unverified_results"] == 1
 
 
-def test_search_exposes_uncalibrated_lexical_match(monkeypatch):
+def test_search_fails_closed_when_lexical_match_omits_safety_envelope(monkeypatch):
     calls = []
 
     async def fake_post(path, body):
@@ -1774,10 +1914,13 @@ def test_search_exposes_uncalibrated_lexical_match(monkeypatch):
     ))
 
     assert len(calls) == 1
-    assert out["count"] == 1
-    assert out["results"][0]["score_calibrated"] is False
-    assert out["retrieval_confidence"]["status"] == "relative_scores_only"
-    assert "not calibrated relevance probabilities" in out["warning"]
+    assert out["count"] == 0
+    assert out["results"] == []
+    assert out["no_match"] is True
+    assert out["abstain_recommended"] is True
+    assert out["query_confidence"] == 0.0
+    assert out["evidence_ids"] == []
+    assert out["safety_reason"].startswith("missing_safety_fields:")
 
 
 # =========== error paths carry the usage/claim block (v0.3.14) ==============

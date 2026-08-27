@@ -19,6 +19,22 @@ Your agent forgets everything when the session ends. This fixes that, and goes f
 
 Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other MCP client.
 
+### Release compatibility
+
+| MCP package | Hosted/API contract | Tool surface | Migration |
+|---|---|---:|---|
+| 0.5.8 | Hebbrix API 1.0.0 / search-safety-v1 | 32 | Adds procedure lifecycle tools |
+
+Version 0.5.8 adds the complete tenant-scoped procedure lifecycle (including
+idempotent deletion), and preserves authoritative batch readiness receipts.
+It also retains 0.5.7's API-owned grounding and abstention envelope: missing,
+malformed, degraded, or ungrounded receipts fail closed with empty evidence.
+
+The hosted server and PyPI package expose their exact package version during
+MCP initialization. The API exposes its immutable deployment build through
+`X-Hebbrix-Build` and `GET /v1/health/build`; OpenAPI `info.version` identifies
+the stable HTTP contract rather than a mutable deployment.
+
 ### Fastest setup: hosted, no account
 
 For an HTTP-capable MCP client, this is the entire setup:
@@ -174,6 +190,14 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_entity_timeline` - What was true about an entity, and when.
 - `hebbrix_graph_query` - Traverse relationships out from a named entity; pass a `timestamp` for point-in-time truth. Results are trimmed (from/to/type/valid_from), not raw backend payloads. (Free-text questions: use `hebbrix_ask`.)
 - `hebbrix_contradictions` - Surface facts that conflict with each other.
+
+**Procedural memory**
+
+- `hebbrix_create_procedure` - Store a scoped condition/action procedure.
+- `hebbrix_list_procedures` / `hebbrix_get_procedure` - Inspect owned procedures.
+- `hebbrix_update_procedure` - Update mutable fields; ownership scope is immutable.
+- `hebbrix_execute_procedure` - Execute a procedure and record the execution.
+- `hebbrix_delete_procedure` - Idempotently delete a procedure and its executions. The API returns the same 204 for deleted, absent, and foreign-tenant IDs so the tool cannot reveal another tenant's identifier.
 
 **Reasoning & account**
 

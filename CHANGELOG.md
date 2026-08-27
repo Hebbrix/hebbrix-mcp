@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.5.8 — 2026-08-27
+
+- Added create/list/get/update/execute/delete tools for the canonical
+  `/v1/procedures` lifecycle, with explicit tenant scope and destructive safety
+  annotations.
+- Preserved batch `processing_status`, `searchable`, outbox event, and status URL
+  so asynchronous MCP writes never imply query readiness.
+- Aligned idempotent procedure deletion with REST, OpenAPI, Python, and
+  TypeScript: a successful tool call represents the API's non-oracular 204.
+
+## 0.5.6 — 2026-08-15
+
+- Declared compatibility with the August 15, 2026 Hebbrix API r96 contract:
+  predicate-grounded search abstention, bounded 201/202 raw-write readiness,
+  and operation-specific idempotency metadata in OpenAPI.
+- Made warning-free import and the complete test suite mandatory under
+  `-W error` on Python 3.10, 3.11, 3.12, and 3.13.
+- Kept the public MCP surface stable at 26 tools; no client migration is
+  required from 0.5.5.
+
 ## 0.5.5 — 2026-08-15
 
 - Added explicit read-only, destructive, idempotent, and open-world MCP safety
