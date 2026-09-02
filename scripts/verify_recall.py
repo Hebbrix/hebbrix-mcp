@@ -176,6 +176,13 @@ async def main(args):
                         False,
                         http_status=response.status_code,
                         request_id=response.headers.get("x-request-id"),
+                        error_code=(
+                            (response.json().get("error") or {}).get("message") or {}
+                        ).get("code")
+                        if isinstance(
+                            (response.json().get("error") or {}).get("message"), dict
+                        )
+                        else None,
                     )
                     raise RuntimeError(
                         f"Disposable tenant signup failed: HTTP {response.status_code}"
@@ -370,6 +377,10 @@ async def main(args):
                             )
                             await asyncio.sleep(args.pace_seconds)
                     if phase == "settled":
+                        # Keep absence checks separate from the preceding
+                        # evidence workload's per-minute reasoning budget.
+                        # A rate-limit error is not a factual abstention.
+                        await asyncio.sleep(args.unknown_cooldown_seconds)
                         for index, question in enumerate(
                             [
                                 "What is Lena Frost's private signing key?",
@@ -392,7 +403,12 @@ async def main(args):
                                 not error
                                 and not data.get("citations")
                                 and data.get("abstain_recommended") is True,
+                                is_error=error,
+                                evidence_count=len(data.get("citations") or []),
+                                failure_category=data.get("failure_category"),
+                                diagnostics=data.get("diagnostics"),
                             )
+                            await asyncio.sleep(args.pace_seconds)
                         if args.require_graph:
                             for _ in range(4):
                                 error, graph = await call(
@@ -464,7 +480,8 @@ if __name__ == "__main__":
     )
     parser.add_argument("--version", default="0.5.11")
     parser.add_argument("--settle-seconds", type=float, default=30)
-    parser.add_argument("--pace-seconds", type=float, default=1)
+    parser.add_argument("--pace-seconds", type=float, default=2.1)
+    parser.add_argument("--unknown-cooldown-seconds", type=float, default=61)
     parser.add_argument("--require-graph", action="store_true")
     parser.add_argument("--allow-remote", action="store_true")
     args = parser.parse_args()
