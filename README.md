@@ -7,7 +7,14 @@
 [![Python](https://img.shields.io/pypi/pyversions/hebbrix-mcp)](https://pypi.org/project/hebbrix-mcp/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A Model Context Protocol server that gives any AI agent long-term memory and a temporal knowledge graph, backed by [Hebbrix](https://www.hebbrix.com).
+A Model Context Protocol server that gives any AI agent persistent memory, a
+temporal knowledge graph, and outcome-based learning, backed by
+[Hebbrix](https://www.hebbrix.com).
+
+This repository is the MIT-licensed MCP adapter. Durable storage, retrieval,
+graph processing, reasoning, and Outcome Memory are provided by the Hebbrix
+cloud API; this repository does not claim that the backend is self-hostable or
+open source.
 
 Your agent forgets everything when the session ends. This fixes that, and goes further than a plain memory store:
 
@@ -23,9 +30,13 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
+| 0.5.9 | Hebbrix API 1.0.0 / search-safety-v1 | 33 | Uniform MCP errors, safe recall fallback, graph readiness |
 | 0.5.8 | Hebbrix API 1.0.0 / search-safety-v1 | 32 | Adds procedure lifecycle tools |
 
-Version 0.5.8 adds the complete tenant-scoped procedure lifecycle (including
+Version 0.5.9 makes structured failures real MCP errors over both stdio and
+hosted HTTP, preserves authoritative recall when GraphRAG abstains by returning
+an explicitly retrieval-only result, and adds bounded graph-enrichment status
+polling. Version 0.5.8 added the complete tenant-scoped procedure lifecycle (including
 idempotent deletion), and preserves authoritative batch readiness receipts.
 It also retains 0.5.7's API-owned grounding and abstention envelope: missing,
 malformed, degraded, or ungrounded receipts fail closed with empty evidence.
@@ -189,6 +200,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_search_entities` - List known entities (people, orgs, tools, places).
 - `hebbrix_entity_timeline` - What was true about an entity, and when.
 - `hebbrix_graph_query` - Traverse relationships out from a named entity; pass a `timestamp` for point-in-time truth. Results are trimmed (from/to/type/valid_from), not raw backend payloads. (Free-text questions: use `hebbrix_ask`.)
+- `hebbrix_graph_status` - Check one memory's asynchronous graph readiness, optionally polling for up to 30 seconds. Readiness comes from durable, source-revision-bound delivery acknowledgements—not elapsed time, search readiness, or an empty graph query. It distinguishes successful enrichment with no related facts from a still-processing, failed, or temporarily unreadable graph.
 - `hebbrix_contradictions` - Surface facts that conflict with each other.
 
 **Procedural memory**
@@ -201,7 +213,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
 
 **Reasoning & account**
 
-- `hebbrix_ask` - **One-call GraphRAG.** Ask a natural-language question; it searches memory, synthesizes an answer with an LLM, cites the memory ids it used, and enriches with knowledge-graph relationships + your profile. Use instead of orchestrating search + graph + profile yourself.
+- `hebbrix_ask` - **One-call GraphRAG.** Ask a natural-language question; it searches memory, synthesizes an answer with an LLM, and cites the memory ids it used. If synthesis abstains while authoritative search has grounded evidence, it returns that evidence as `synthesis_status: "retrieval_only"` instead of silently losing recall or pretending synthesis succeeded.
 - `hebbrix_confidence` - How confident should the agent be before acting? Grounded in memory + past outcomes.
 - `hebbrix_log_decision` - Record a decision and its outcome; feeds future confidence. Right after a `hebbrix_confidence` check you can log just the `outcome` — the description auto-fills from what you asked.
 - `hebbrix_choose_action` - Safely choose among repeatable strategies and create
@@ -329,9 +341,9 @@ Common issues:
 ```bash
 git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
-./quick_setup.sh            # venv + editable install
-source venv/bin/activate
-pytest tests/ -q            # 93 offline tests, no network needed
+python -m pip install uv==0.8.4
+uv sync --frozen --extra dev
+uv run --frozen pytest tests/ -q -W error  # offline; no network or key needed
 hebbrix-mcp                 # starts in agent mode on stdio
 ```
 

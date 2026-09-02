@@ -136,7 +136,6 @@ def reset_usage():
     S._AUTH_COLLECTION_CACHE.clear()
     S._REQUEST_KEY.set("")
     S._REQUEST_COLLECTION.set("")
-    S._REQUEST_HOSTED.set(False)
     yield
     S._LAST_USAGE.set(None)
     S._LAST_USAGE_SIG = None
@@ -146,7 +145,6 @@ def reset_usage():
     S._AUTH_COLLECTION_CACHE.clear()
     S._REQUEST_KEY.set("")
     S._REQUEST_COLLECTION.set("")
-    S._REQUEST_HOSTED.set(False)
 
 
 def _fake(monkeypatch, response: FakeResponse) -> FakeClient:
@@ -182,7 +180,7 @@ def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 32
+        assert len(tools) == 33
         names = {t.name for t in tools}
         assert "hebbrix_extraction_status" in names
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
@@ -190,6 +188,7 @@ def test_all_tools_resources_prompts_registered():
                          "hebbrix_history", "hebbrix_search_entities",
                          "hebbrix_entity_timeline", "hebbrix_graph_query",
                          "hebbrix_contradictions", "hebbrix_confidence",
+                         "hebbrix_graph_status",
                          "hebbrix_log_decision", "hebbrix_list_collections",
                          "hebbrix_account_status", "hebbrix_export",
                          "hebbrix_remember_many", "hebbrix_ask", "hebbrix_mark_used",
@@ -439,6 +438,156 @@ def test_graph_query_depth_clamped(monkeypatch):
     asyncio.run(S.hebbrix_graph_query("x", depth=99, collection_id="c1"))
     body = client.calls[-1][2]["json"]
     assert body["depth"] == 5
+
+
+def test_graph_status_distinguishes_complete_memory_without_edges(monkeypatch):
+    class GraphStatusClient(FakeClient):
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/knowledge-graph/relationships/" in url:
+                return FakeResponse(200, {"count": 0, "related_memories": []})
+            return FakeResponse(200, {
+                "memory_id": "m1",
+                "status": "completed",
+                "ready": True,
+                "terminal": True,
+                "search_index_status": "completed",
+                "delivery_count": 2,
+                "completed_delivery_count": 2,
+            })
+
+    client = GraphStatusClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+
+    out = asyncio.run(S.hebbrix_graph_status("m1"))
+
+    assert out["ready"] is True
+    assert out["enrichment_ready"] is True
+    assert out["status"] == "complete_no_related_graph_facts"
+    assert out["delivery_status"] == "completed"
+    assert out["graph_check"] == {
+        "available": True,
+        "relationship_count": 0,
+    }
+
+
+def test_graph_status_reports_extracted_relationships_ready(monkeypatch):
+    class GraphStatusClient(FakeClient):
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/knowledge-graph/relationships/" in url:
+                return FakeResponse(200, {
+                    "count": 1,
+                    "related_memories": [{"memory_id": "m2"}],
+                })
+            return FakeResponse(200, {
+                "memory_id": "m1",
+                "status": "completed",
+                "ready": True,
+                "terminal": True,
+                "search_index_status": "completed",
+                "delivery_count": 2,
+                "completed_delivery_count": 2,
+            })
+
+    client = GraphStatusClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+
+    out = asyncio.run(S.hebbrix_graph_status("m1"))
+
+    assert out["ready"] is True
+    assert out["status"] == "ready"
+    assert out["graph_check"]["relationship_count"] == 1
+
+
+def test_graph_status_does_not_treat_unavailable_graph_as_no_facts(monkeypatch):
+    class GraphStatusClient(FakeClient):
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/knowledge-graph/relationships/" in url:
+                return FakeResponse(200, {
+                    "count": 0,
+                    "related_memories": [],
+                    "note": "Knowledge graph temporarily unavailable",
+                })
+            return FakeResponse(200, {
+                "memory_id": "m1",
+                "status": "completed",
+                "ready": True,
+                "terminal": True,
+                "search_index_status": "completed",
+            })
+
+    client = GraphStatusClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+
+    out = asyncio.run(S.hebbrix_graph_status("m1"))
+
+    assert out["enrichment_ready"] is True
+    assert out["ready"] is False
+    assert out["status"] == "ready_graph_read_temporarily_unavailable"
+    assert out["graph_check"]["available"] is False
+
+
+def test_graph_status_does_not_query_graph_before_delivery_is_ready(monkeypatch):
+    client = _fake(monkeypatch, FakeResponse(200, {
+        "memory_id": "m1",
+        "status": "processing",
+        "ready": False,
+        "terminal": False,
+        "search_index_status": "completed",
+        "delivery_count": 2,
+        "completed_delivery_count": 1,
+    }))
+
+    out = asyncio.run(S.hebbrix_graph_status("m1"))
+
+    assert out["status"] == "processing"
+    assert out["ready"] is False
+    assert out["delivery_status"] == "processing"
+    assert len(client.calls) == 1
+    assert "/knowledge-graph/status/m1" in client.calls[0][1]
+
+
+def test_graph_status_bounded_polling_stops_on_durable_completion(monkeypatch):
+    class PollingGraphStatusClient(FakeClient):
+        def __init__(self):
+            super().__init__(FakeResponse(200, {}))
+            self.status_calls = 0
+
+        async def get(self, url, **kw):
+            self.calls.append(("GET", url, kw))
+            if "/knowledge-graph/relationships/" in url:
+                return FakeResponse(200, {"count": 0, "related_memories": []})
+            self.status_calls += 1
+            if self.status_calls == 1:
+                return FakeResponse(200, {
+                    "memory_id": "m1",
+                    "status": "processing",
+                    "ready": False,
+                    "terminal": False,
+                    "search_index_status": "completed",
+                })
+            return FakeResponse(200, {
+                "memory_id": "m1",
+                "status": "completed",
+                "ready": True,
+                "terminal": True,
+                "search_index_status": "completed",
+            })
+
+    async def no_wait(_seconds):
+        return None
+
+    client = PollingGraphStatusClient()
+    monkeypatch.setattr(S, "_client", lambda: client)
+    monkeypatch.setattr(S.asyncio, "sleep", no_wait)
+
+    out = asyncio.run(S.hebbrix_graph_status("m1", wait_seconds=1))
+
+    assert out["status"] == "complete_no_related_graph_facts"
+    assert out["poll_attempts"] == 2
+    assert client.status_calls == 2
 
 
 def test_export_json_bundles_memories_entities_profile(monkeypatch):
@@ -711,7 +860,7 @@ def test_graph_evidence_reconciles_memory_only_abstention():
     assert [item["id"] for item in added] == ["m1", "m2"]
 
 
-def test_ask_fails_closed_when_reason_unavailable(monkeypatch):
+def test_ask_uses_authoritative_retrieval_when_reason_unavailable(monkeypatch):
     class AskClient(FakeClient):
         async def post(self, url, **kw):
             self.calls.append(("POST", url, kw))
@@ -719,7 +868,12 @@ def test_ask_fails_closed_when_reason_unavailable(monkeypatch):
                 return FakeResponse(503, text="quota")
             if url.endswith("/search"):
                 return FakeResponse(200, {"results": [
-                    {"memory_id": "m9", "content": "hit", "score": 0.7}]})
+                    {
+                        "memory_id": "m9",
+                        "content": "The production deployment region is eu-west-1.",
+                        "score": 0.7,
+                    }
+                ]})
             return FakeResponse(200, {})
 
         async def get(self, url, **kw):
@@ -727,19 +881,27 @@ def test_ask_fails_closed_when_reason_unavailable(monkeypatch):
             return FakeResponse(200, {"entities": []} if "entities" in url else {"static": []})
     client = AskClient(FakeResponse(200, {}))
     monkeypatch.setattr(S, "_client", lambda: client)
-    out = asyncio.run(S.hebbrix_ask("q", collection_id="c1", include_graph=False))
-    assert out["answer"] is None
-    assert out["citations"] == []
-    assert out["abstain_recommended"] is True
-    assert out["evidence_ids"] == []
+    out = asyncio.run(S.hebbrix_ask(
+        "Which region hosts our production deployment?",
+        collection_id="c1",
+        include_graph=False,
+    ))
+    assert "eu-west-1" in out["answer"]
+    assert out["citations"] == [{
+        "id": "m9",
+        "content": "The production deployment region is eu-west-1.",
+        "score": 0.7,
+    }]
+    assert out["abstain_recommended"] is False
+    assert out["evidence_ids"] == ["m9"]
+    assert out["synthesis_status"] == "retrieval_only"
+    assert out["retrieval_fallback"] is True
     assert out["reasoning_disabled"] == "unavailable"
-    assert "failed closed" in out["note"].lower()
+    assert "no model synthesis" in out["note"].lower()
 
 
 def test_ask_signals_quota_exhaustion_explicitly(monkeypatch):
-    """Red-team #1: a 402 must NOT silently degrade to raw search hits. The result
-    has to say the flagship reasoning layer is OFF, that these are raw hits, and
-    that retrying is pointless."""
+    """A 402 can return receipted retrieval, but must not disguise it as synthesis."""
     class QuotaClient(FakeClient):
         async def post(self, url, **kw):
             self.calls.append(("POST", url, kw))
@@ -756,10 +918,32 @@ def test_ask_signals_quota_exhaustion_explicitly(monkeypatch):
     client = QuotaClient(FakeResponse(200, {}))
     monkeypatch.setattr(S, "_client", lambda: client)
     out = asyncio.run(S.hebbrix_ask("q", collection_id="c1", include_graph=False))
-    assert out["answer"] is None
+    assert "hit" in out["answer"]
+    assert out["synthesis_status"] == "retrieval_only"
     assert out["reasoning_disabled"] == "quota_exhausted"
     assert "do not retry" in out["note"].lower()
-    assert "no raw search citations" in out["note"].lower()
+    assert "without model synthesis" in out["note"].lower()
+
+
+def test_ask_still_fails_closed_when_reason_and_search_abstain(monkeypatch):
+    class AbstainingClient(FakeClient):
+        async def post(self, url, **kw):
+            self.calls.append(("POST", url, kw))
+            if url.endswith("/search/reason"):
+                return FakeResponse(200, {"answer": None, "sources": []})
+            if url.endswith("/search"):
+                return FakeResponse(200, {"results": []})
+            return FakeResponse(200, {})
+
+    client = AbstainingClient(FakeResponse(200, {}))
+    monkeypatch.setattr(S, "_client", lambda: client)
+
+    out = asyncio.run(S.hebbrix_ask("unknown", collection_id="c1"))
+
+    assert out["answer"] is None
+    assert out["citations"] == []
+    assert out["abstain_recommended"] is True
+    assert out["evidence_ids"] == []
 
 
 def test_confidence_signals_quota_exhaustion(monkeypatch):
@@ -1496,16 +1680,35 @@ def test_invalid_guest_cookie_is_rejected_without_identity_reset(monkeypatch):
     assert not any(m.get("type") == "INNER_APP_CALLED" for m in sent)
 
 
-def test_hosted_validation_failure_raises_real_tool_error(monkeypatch):
+def test_direct_tool_errors_remain_composable(monkeypatch):
+    monkeypatch.setattr(S, "DEFAULT_COLLECTION", "")
+
+    out = asyncio.run(S.hebbrix_search("q"))
+
+    assert out == {"error": "no collection_id is available for this MCP session"}
+
+
+def test_stdio_dispatch_validation_failure_raises_real_tool_error(monkeypatch):
+    """Protocol errors cannot depend on transport-specific request context."""
     from mcp.server.fastmcp.exceptions import ToolError
 
     monkeypatch.setattr(S, "DEFAULT_COLLECTION", "")
-    token = S._REQUEST_HOSTED.set(True)
-    try:
-        with pytest.raises(ToolError):
-            asyncio.run(S.hebbrix_search("q"))
-    finally:
-        S._REQUEST_HOSTED.reset(token)
+
+    with pytest.raises(ToolError) as exc:
+        asyncio.run(S.mcp.call_tool("hebbrix_search", {"query": "q"}))
+
+    assert "no collection_id" in str(exc.value)
+
+
+def test_protocol_promotes_upstream_not_found_to_tool_error(monkeypatch):
+    from mcp.server.fastmcp.exceptions import ToolError
+
+    _fake(monkeypatch, FakeResponse(404, text="not found"))
+
+    with pytest.raises(ToolError) as exc:
+        asyncio.run(S.mcp.call_tool("hebbrix_get", {"memory_id": "foreign"}))
+
+    assert "HTTP 404" in str(exc.value)
 
 
 # ============================================================================
