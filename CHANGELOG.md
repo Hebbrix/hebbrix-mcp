@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.9 — 2026-09-01
+
+- Made every structured tool failure a real MCP `isError=true` response over
+  both local stdio and hosted HTTP. Direct Python tool functions retain their
+  structured dictionaries for composition and unit testing.
+- Added a safety-preserving `hebbrix_ask` fallback: when GraphRAG abstains but
+  authoritative search has receipted evidence, the tool returns clearly marked
+  `retrieval_only` evidence without claiming model synthesis.
+- Added `hebbrix_graph_status` with bounded polling over durable, applied
+  delivery acknowledgements and honest terminal states, including successful
+  enrichment with no related facts and a distinct temporarily-unreadable state.
+- Reproducibly install the hosted image from `uv.lock`, pin container bases by
+  digest and GitHub Actions by commit, and add dependency/security audit gates
+  plus release provenance.
+- Updated the public surface and test-count documentation to match the package.
+
 ## 0.5.8 — 2026-08-27
 
 - Added create/list/get/update/execute/delete tools for the canonical

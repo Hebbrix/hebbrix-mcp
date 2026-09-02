@@ -10,20 +10,25 @@
 #   docker run -p 8080:8080 hebbrix-mcp        # serves http://0.0.0.0:8080/mcp
 #   curl localhost:8080/healthz                # -> {"status":"ok",...} (no auth)
 #
-FROM python:3.12-slim
+FROM ghcr.io/astral-sh/uv:0.8.4@sha256:40775a79214294fb51d097c9117592f193bcfdfc634f4daa0e169ee965b10ef0 AS uv
+FROM python:3.12-slim@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1 \
+    UV_COMPILE_BYTECODE=1 \
+    UV_LINK_MODE=copy \
+    UV_NO_CACHE=1 \
     HEBBRIX_MCP_MULTI_TENANT=1 \
     HEBBRIX_MCP_HOST=0.0.0.0 \
-    HEBBRIX_MCP_PORT=8080
+    HEBBRIX_MCP_PORT=8080 \
+    PATH="/app/.venv/bin:$PATH"
 
 WORKDIR /app
 
-# Install deps first (better layer caching), then the package itself.
-COPY pyproject.toml README.md ./
+# Install exactly the hash-locked dependency graph, including the project.
+COPY --from=uv /uv /uvx /bin/
+COPY pyproject.toml uv.lock README.md LICENSE ./
 COPY hebbrix_mcp ./hebbrix_mcp
-RUN pip install ".[hosted]"
+RUN uv sync --frozen --no-dev --extra hosted --no-editable
 
 # Run as a non-root user.
 RUN useradd -m -u 10001 hebbrix

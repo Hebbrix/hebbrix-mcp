@@ -7,9 +7,8 @@ Thanks for helping make agent memory better. This is a small, focused codebase â
 ```bash
 git clone https://github.com/Hebbrix/hebbrix-mcp
 cd hebbrix-mcp
-./quick_setup.sh              # creates ./venv and installs editable
-source venv/bin/activate
-pip install -e ".[dev]"       # pytest + ruff (CI runs both)
+python -m pip install uv==0.8.4
+uv sync --frozen --extra dev  # exact, hash-verified development environment
 ```
 
 ## Layout
@@ -31,7 +30,7 @@ Dockerfile                â€” hosted / self-hosted multi-tenant image
 hebbrix-mcp                                  # stdio, agent mode if no key
 HEBBRIX_API_KEY=... hebbrix-mcp              # stdio with your key
 hebbrix-mcp --transport streamable-http      # HTTP at 127.0.0.1:8080/mcp
-pytest tests/ -q                             # must stay green
+uv run --frozen pytest tests/ -q -W error    # must stay green
 ```
 
 ## Guidelines
@@ -51,7 +50,7 @@ pytest tests/ -q                             # must stay green
 
 1. Fork, branch from `main`.
 2. Make the change + add/adjust tests.
-3. `pytest tests/ -q` green, `python -m py_compile hebbrix_mcp/server.py` clean.
+3. `uv run --frozen pytest tests/ -q -W error` green, Ruff and security audits clean.
 4. Update `CHANGELOG.md` under an "Unreleased" heading.
 5. Open the PR with a clear description of the behavior change.
 
