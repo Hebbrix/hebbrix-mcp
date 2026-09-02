@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.10 — 2026-09-02
+
+- Derive write readiness from the upstream acknowledgement, never from the
+  requested wait. Preserve pending receipts and polling instructions across raw
+  writes, updates, fetches, extraction responses, and sequential batch fallback.
+- Report graph enrichment completion independently of related-memory counts.
+  Zero neighboring memories no longer implies zero extracted entity edges;
+  entity-edge counts are explicitly unknown on the neighbor-only endpoint.
+- Add regressions for delayed indexing and every readiness projection.
+- Companion backend changes correct discourse-prefaced and recorded-field
+  questions, full identifier binding, collaboration relations, human approval
+  questions, and deployment-location/procedure distinctions. These require the
+  matching backend rollout; the adapter does not bypass upstream grounding.
+- Companion backend collection deletion preserves authenticated identity across
+  transaction rollback, preventing an expired ORM read during retry.
+
 ## 0.5.9 — 2026-09-01
 
 - Made every structured tool failure a real MCP `isError=true` response over

@@ -440,7 +440,7 @@ def test_graph_query_depth_clamped(monkeypatch):
     assert body["depth"] == 5
 
 
-def test_graph_status_distinguishes_complete_memory_without_edges(monkeypatch):
+def test_graph_status_zero_neighbors_does_not_claim_zero_entity_edges(monkeypatch):
     class GraphStatusClient(FakeClient):
         async def get(self, url, **kw):
             self.calls.append(("GET", url, kw))
@@ -463,15 +463,15 @@ def test_graph_status_distinguishes_complete_memory_without_edges(monkeypatch):
 
     assert out["ready"] is True
     assert out["enrichment_ready"] is True
-    assert out["status"] == "complete_no_related_graph_facts"
+    assert out["status"] == "ready"
     assert out["delivery_status"] == "completed"
-    assert out["graph_check"] == {
-        "available": True,
-        "relationship_count": 0,
-    }
+    assert out["graph_check"]["available"] is True
+    assert out["graph_check"]["related_memory_count"] == 0
+    assert out["graph_check"]["entity_relationship_count"] is None
+    assert "relationship_count" not in out["graph_check"]
 
 
-def test_graph_status_reports_extracted_relationships_ready(monkeypatch):
+def test_graph_status_reports_neighbor_memories_separately_from_entity_edges(monkeypatch):
     class GraphStatusClient(FakeClient):
         async def get(self, url, **kw):
             self.calls.append(("GET", url, kw))
@@ -497,7 +497,8 @@ def test_graph_status_reports_extracted_relationships_ready(monkeypatch):
 
     assert out["ready"] is True
     assert out["status"] == "ready"
-    assert out["graph_check"]["relationship_count"] == 1
+    assert out["graph_check"]["related_memory_count"] == 1
+    assert out["graph_check"]["entity_relationship_count"] is None
 
 
 def test_graph_status_does_not_treat_unavailable_graph_as_no_facts(monkeypatch):
@@ -585,7 +586,7 @@ def test_graph_status_bounded_polling_stops_on_durable_completion(monkeypatch):
 
     out = asyncio.run(S.hebbrix_graph_status("m1", wait_seconds=1))
 
-    assert out["status"] == "complete_no_related_graph_facts"
+    assert out["status"] == "ready"
     assert out["poll_attempts"] == 2
     assert client.status_calls == 2
 
@@ -1209,13 +1210,77 @@ def test_pow_solver_produces_valid_nonce():
 
 # ------------------------- remember routing + read-after-write (v0.3.5) ------
 def test_remember_default_is_raw_with_wait_for_index(monkeypatch):
-    client = _fake(monkeypatch, FakeResponse(201, {"id": "m1"}))
+    client = _fake(monkeypatch, FakeResponse(201, {
+        "id": "m1", "processing_status": "completed", "searchable": True,
+    }))
     out = asyncio.run(S.hebbrix_remember("a clean fact", collection_id="c1"))
     _, url, kw = client.calls[-1]
     assert url.endswith("/memories/raw")
     assert kw["json"]["wait_for_index"] is True   # searchable on return
     assert "infer" not in kw["json"]              # no more ignored infer flag
     assert out["searchable"] is True
+
+
+@pytest.mark.parametrize("wait_for_index", [True, False])
+@pytest.mark.parametrize("searchable", [True, False, None])
+def test_remember_readiness_comes_from_receipt_not_request(monkeypatch, wait_for_index, searchable):
+    receipt = {
+        "id": "m-pending", "processing_status": "pending",
+        "outbox_event_id": "event-1", "status_url": "/v1/memories/m-pending",
+        "index_wait_outcome": "timed_out", "retry_after_seconds": 2,
+    }
+    if searchable is not None:
+        receipt["searchable"] = searchable
+    _fake(monkeypatch, FakeResponse(202, receipt))
+    out = asyncio.run(S.hebbrix_remember("fact", collection_id="c1", wait_for_index=wait_for_index))
+    assert out["searchable"] is (searchable is True)
+    for key in ("outbox_event_id", "status_url", "index_wait_outcome", "retry_after_seconds"):
+        assert out[key] == receipt[key]
+    if not searchable:
+        assert "do not" in out["next_action"].lower()
+        assert "hebbrix_get" in out["next_action"]
+
+
+def test_completed_extraction_does_not_override_explicit_pending_index():
+    out = S._shape_extraction_result({
+        "status": "completed", "result": {"searchable": False, "results": []},
+    })
+    assert out["searchable"] is False
+
+
+@pytest.mark.parametrize("searchable,status", [(False, "pending"), (True, "completed")])
+def test_get_preserves_authoritative_index_receipt_for_polling(monkeypatch, searchable, status):
+    _fake(monkeypatch, FakeResponse(200, {
+        "id": "m1", "content": "fact", "searchable": searchable,
+        "processing_status": status, "outbox_event_id": "e1",
+        "status_url": "/v1/memories/m1",
+    }))
+    out = asyncio.run(S.hebbrix_get("m1"))
+    assert out["searchable"] is searchable
+    assert out["processing_status"] == status
+    assert out["outbox_event_id"] == "e1"
+
+
+def test_update_preserves_pending_receipt(monkeypatch):
+    _fake(monkeypatch, FakeResponse(202, {"id": "m1", "searchable": False,
+        "processing_status": "processing", "outbox_event_id": "e1"}))
+    out = asyncio.run(S.hebbrix_update("m1", content="corrected", wait_for_index=True))
+    assert out["searchable"] is False
+    assert out["outbox_event_id"] == "e1"
+    assert out["updated"] is True
+
+
+def test_sequential_batch_fallback_keeps_every_pending_receipt(monkeypatch):
+    class SequentialClient(FakeClient):
+        async def post(self, url, **kw):
+            if url.endswith("/batch"):
+                return FakeResponse(403, {"error": "tier"})
+            return FakeResponse(202, {"id": "m1", "searchable": False,
+                "processing_status": "pending", "outbox_event_id": "e1"})
+    monkeypatch.setattr(S, "_client", lambda: SequentialClient(FakeResponse()))
+    out = asyncio.run(S.hebbrix_remember_many(["fact"], collection_id="c1", wait_for_index=True))
+    assert out["searchable"] is False
+    assert out["results"][0]["outbox_event_id"] == "e1"
 
 
 def test_remember_extract_routes_to_smart_endpoint(monkeypatch):
@@ -1880,7 +1945,7 @@ def test_handshake_reports_hebbrix_version_not_sdk():
 
 # --------------------------- graph enrichment state (v0.3.11) ---------------
 def test_remember_flags_async_graph_enrichment(monkeypatch):
-    _fake(monkeypatch, FakeResponse(201, {"id": "m1"}))
+    _fake(monkeypatch, FakeResponse(201, {"id": "m1", "searchable": True}))
     out = asyncio.run(S.hebbrix_remember("Atlas is our deploy tool", collection_id="c1"))
     # wait_for_index covers memory search; the graph is enriched separately.
     assert out["graph_enrichment"] == "processing"
