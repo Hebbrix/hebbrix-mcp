@@ -786,7 +786,18 @@ async def _post(path: str, body: dict) -> Any:
         json={k: v for k, v in body.items() if v is not None},
         headers=_auth_headers())
     _capture_usage(r)
-    return _err(r) if r.status_code >= 400 else r.json()
+    data = _err(r) if r.status_code >= 400 else r.json()
+    if path in {"/search", "/search/reason"} and isinstance(data, dict):
+        # Response-local diagnostics, never mutable global state: concurrent
+        # hosted tenants must not inherit another request's identifiers.
+        data = dict(data)
+        diagnostics = {"http_status": r.status_code}
+        for header, key in (("x-request-id", "request_id"), ("x-hebbrix-build", "build")):
+            value = r.headers.get(header)
+            if value and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", value):
+                diagnostics[key] = value
+        data["_request_diagnostics"] = diagnostics
+    return data
 
 
 async def _patch(path: str, body: dict) -> Any:
@@ -1470,6 +1481,8 @@ def _fail_closed_search_payload(query: str, upstream: Any) -> dict[str, Any]:
 def _authoritative_reason_safety(data: Any) -> tuple[bool, str | None]:
     """Validate reasoning citations against the same API-owned evidence IDs."""
 
+    if not isinstance(data, dict):
+        return False, "malformed_safety_envelope"
     valid, reason = _authoritative_search_safety(
         dict(data or {})
         | {
@@ -1479,6 +1492,52 @@ def _authoritative_reason_safety(data: Any) -> tuple[bool, str | None]:
         }
     )
     return valid, reason
+
+
+def _evidence_failure(data: Any, *, valid: bool, synthesis: bool = False) -> str | None:
+    """Classify abstention separately from operational failures; never certify evidence."""
+    if not isinstance(data, dict):
+        return "malformed_evidence_receipt"
+    if _reasoning_quota_exhausted(data):
+        return "quota_exhausted"
+    if data.get("error"):
+        return "service_failure"
+    grounding = data.get("grounding") or {}
+    if isinstance(grounding, dict) and (
+        grounding.get("status") == "verification_unavailable"
+        or grounding.get("reason") in {"claim_verifier_unavailable", "required_reranker_unavailable"}
+    ):
+        return "verification_unavailable"
+    if not valid:
+        return "malformed_evidence_receipt"
+    if data.get("degraded"):
+        return "service_failure"
+    if data.get("no_match") or data.get("abstain_recommended"):
+        if isinstance(grounding, dict) and grounding.get("status") == "soft_candidate":
+            return "unverified_candidates"
+        return "unknown_fact"
+    if synthesis and not data.get("answer"):
+        return "synthesis_abstention"
+    return None
+
+
+def _evidence_diagnostics(data: Any) -> dict[str, Any]:
+    """Only safe, bounded provenance. No queries, memory text, URLs or auth headers."""
+    if not isinstance(data, dict):
+        return {}
+    out = dict(data.get("_request_diagnostics") or {})
+    grounding = data.get("grounding") or {}
+    fields = {"safety_version": data.get("safety_contract_version")}
+    if isinstance(grounding, dict):
+        fields.update(grounding_version=grounding.get("contract_version"),
+                      grounding_status=grounding.get("status"),
+                      grounding_reason=grounding.get("reason"))
+    for key, value in fields.items():
+        if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", value):
+            out[key] = value
+    if isinstance(data.get("cache_hit"), bool):
+        out["cache_hit"] = data["cache_hit"]
+    return out
 
 
 @mcp.tool(annotations=_READ_TOOL)
@@ -1511,8 +1570,11 @@ async def hebbrix_search(
     if min_score > 0.0:
         search_body["threshold"] = min_score
     data = await _post("/search", search_body)
-    if "error" in data:
-        return _u(_fence_results(_fail_closed_search_payload(query, data), "results"))
+    if not isinstance(data, dict) or "error" in data:
+        payload = _fail_closed_search_payload(query, data)
+        payload.update(failure_category=_evidence_failure(data, valid=False),
+                       diagnostics=_evidence_diagnostics(data))
+        return _u(_fence_results(payload, "results"))
     escalated_for_relevance = False
     suppressed_unverified = 0
     initial_safety_valid, _ = _authoritative_search_safety(data)
@@ -1639,6 +1701,8 @@ async def hebbrix_search(
         "degraded": bool(data.get("degraded")),
         "processing_time_ms": data.get("processing_time_ms"),
         "retrieval_confidence": confidence,
+        "failure_category": _evidence_failure(data, valid=safety_valid),
+        "diagnostics": _evidence_diagnostics(data),
     }
     if pending_writes:
         payload["pending_writes"] = pending_writes
@@ -2050,6 +2114,7 @@ async def hebbrix_ask(
     del include_graph  # graph/profile data cannot bypass the reasoning receipt
     r = await _post("/search/reason", {"query": question, "collection_id": cid})
     safety_valid, safety_reason = _authoritative_reason_safety(r)
+    reasoning_failure = _evidence_failure(r, valid=safety_valid, synthesis=True)
     fail_closed = bool(
         not safety_valid
         or not isinstance(r, dict)
@@ -2126,6 +2191,12 @@ async def hebbrix_ask(
                     "retrieval_fallback": True,
                     "reasoning_safety_reason": reason,
                     "reasoning_disabled": disabled,
+                    "reasoning_failure_category": (
+                        "synthesis_abstention" if reasoning_failure == "unknown_fact"
+                        else reasoning_failure
+                    ),
+                    "diagnostics": {"reasoning": _evidence_diagnostics(r),
+                                    "retrieval": retrieval.get("diagnostics", {})},
                     "note": (
                         (
                             f"{_QUOTA_NOTE} Authoritative search evidence is "
@@ -2143,6 +2214,11 @@ async def hebbrix_ask(
                 out["hebbrix_usage"] = retrieval["hebbrix_usage"]
             return _u(out)
 
+        retrieval_failure = retrieval.get("failure_category") if isinstance(retrieval, dict) else None
+        # A failed verification/service call is not proof of an unknown fact.
+        # Prefer that operational explanation over the fallback's empty set.
+        failure = next((value for value in (retrieval_failure, reasoning_failure)
+                        if value and value != "unknown_fact"), "unknown_fact")
         return _u(
             _fence_results(
                 {
@@ -2165,12 +2241,20 @@ async def hebbrix_ask(
                     ),
                     "safety_reason": reason,
                     "reasoning_disabled": disabled,
+                    "failure_category": failure,
+                    **({"error": f"Evidence unavailable: {failure}", "ok": False}
+                       if failure in {"service_failure", "verification_unavailable", "malformed_evidence_receipt"}
+                       else {}),
+                    "reasoning_failure_category": reasoning_failure,
+                    "synthesis_status": "abstained",
+                    "diagnostics": {"reasoning": _evidence_diagnostics(r),
+                                    "retrieval": retrieval.get("diagnostics", {}) if isinstance(retrieval, dict) else {}},
                     "note": (
                         (
                             f"{_QUOTA_NOTE} Failed closed with no raw search citations."
                             if disabled == "quota_exhausted"
-                            else "Reasoning is unavailable; failed closed with no raw "
-                            "search citations."
+                            else f"No authoritative evidence returned ({failure}); "
+                            "failed closed with no raw search citations."
                         )
                     ),
                 },
@@ -2207,6 +2291,8 @@ async def hebbrix_ask(
         "evidence_claims": r.get("evidence_claims", []),
         "safety_contract_version": r.get("safety_contract_version"),
         "degraded": False,
+        "synthesis_status": "synthesized",
+        "diagnostics": {"reasoning": _evidence_diagnostics(r)},
     }
     return _u(_fence_results(out, "citations"))
 

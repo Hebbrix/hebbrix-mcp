@@ -6,6 +6,7 @@ Credentials stay in memory; output contains check labels and safe metadata only.
 
 import argparse
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -139,8 +140,46 @@ async def main(args):
                         "agent_caller": "mcp-recall-regression",
                     },
                 )
+                if response.status_code == 429:
+                    challenge_response = await api.post(
+                        api_root + "/v1/agent-signup/challenge"
+                    )
+                    if challenge_response.status_code == 200:
+                        challenge = challenge_response.json()
+                        bits = int(challenge["difficulty_bits"])
+                        if not 0 <= bits <= 24:
+                            raise RuntimeError(
+                                "Unsupported signup challenge difficulty"
+                            )
+
+                        def solve():
+                            for nonce in range(1 << 27):
+                                digest = hashlib.sha256(
+                                    f"{challenge['challenge']}:{nonce}".encode()
+                                ).digest()
+                                if int.from_bytes(digest, "big") < (1 << (256 - bits)):
+                                    return str(nonce)
+                            raise RuntimeError("Signup challenge budget exhausted")
+
+                        nonce = await asyncio.to_thread(solve)
+                        response = await api.post(
+                            api_root + "/v1/agent-signup",
+                            json={
+                                "agent_caller": "mcp-recall-regression",
+                                "challenge": challenge["challenge"],
+                                "nonce": nonce,
+                            },
+                        )
                 if response.status_code != 201:
-                    raise RuntimeError("Disposable tenant signup failed")
+                    check(
+                        "signup",
+                        False,
+                        http_status=response.status_code,
+                        request_id=response.headers.get("x-request-id"),
+                    )
+                    raise RuntimeError(
+                        f"Disposable tenant signup failed: HTTP {response.status_code}"
+                    )
                 tenants.append(response.json())
             tenant = tenants[0]
             # The collection is unique; the exact reported strings are useful
@@ -149,6 +188,18 @@ async def main(args):
                 "MCP audit 9d95fa9ad4: deployment region is eu-west-3.",
                 "Northstar Workshop requires manual approval before production deployments.",
                 "Lena Frost works with Cedar Labs on Project Quartz.",
+                "Project Copper Finch's staging deployment region is us-east-2.",
+                "Project Copper Finch's production deployment region is eu-central-1.",
+                "Oriole Studio requires two human approvals before production releases.",
+                "Nora Slate collaborates with Alder Research on Project Nimbus.",
+                "Luma Beacon uses DuckDB for local analytics.",
+                "MCP audit b7e64c2f91: deployment region is ca-central-1.",
+                "Project Silver Quill's canary deployment region is ap-northeast-1.",
+                "Project Silver Quill's production deployment region is us-west-2.",
+                "Rowan Systems requires three human approvals before production releases.",
+                "Birch Orbit uses SQLite for local data analysis.",
+                "Birch Orbit uses BigQuery for remote analytics.",
+                "Vale Rios reports to Mira Kestrel.",
             ]
             identities = []
             async with connect(args, tenant) as (version, call):
@@ -216,44 +267,119 @@ async def main(args):
                     identities[2],
                     "Cedar Labs",
                 ),
+                (
+                    "Where is Copper Finch deployed in production?",
+                    identities[4],
+                    "eu-central-1",
+                ),
+                (
+                    "Which organization works with Nora Slate?",
+                    identities[6],
+                    "Alder Research",
+                ),
+                (
+                    "According to memory, what is the deployment region for MCP audit b7e64c2f91?",
+                    identities[8],
+                    "ca-central-1",
+                ),
+                (
+                    "From the saved notes, which AWS region hosts Copper Finch's staging environment?",
+                    identities[3],
+                    "us-east-2",
+                ),
+                (
+                    "May Oriole Studio release to production without human sign-off?",
+                    identities[5],
+                    "two human approvals",
+                ),
+                (
+                    "Which database does Luma Beacon use to analyze data locally?",
+                    identities[7],
+                    "DuckDB",
+                ),
+                (
+                    "Which cloud region hosts Silver Quill's canary environment?",
+                    identities[9],
+                    "ap-northeast-1",
+                ),
+                (
+                    "Which region hosts the canary environment for Project Silver Quill?",
+                    identities[9],
+                    "ap-northeast-1",
+                ),
+                (
+                    "Where is Silver Quill deployed in production?",
+                    identities[10],
+                    "us-west-2",
+                ),
+                (
+                    "Based on the saved notes, may Rowan Systems release to production without human sign-off?",
+                    identities[11],
+                    "three human approvals",
+                ),
+                (
+                    "Which database does Birch Orbit use to analyze data locally?",
+                    identities[12],
+                    "SQLite",
+                ),
+                ("Who does Vale Rios report to?", identities[14], "Mira Kestrel"),
             ]
+            opposite_ids = {
+                identities[3]: identities[4],
+                identities[4]: identities[3],
+                identities[9]: identities[10],
+                identities[10]: identities[9],
+                identities[12]: identities[13],
+            }
             for phase in ("fresh", "settled"):
                 if phase == "settled":
                     await asyncio.sleep(args.settle_seconds)
                 async with connect(args, tenant) as (_, call):
                     for index, (question, identity, value) in enumerate(questions, 1):
-                        for tool, parameter, rows_key in (
-                            ("hebbrix_search", "query", "results"),
-                            ("hebbrix_ask", "question", "citations"),
+                        for tool, parameter, rows_key, limit in (
+                            ("hebbrix_search", "query", "results", 5),
+                            ("hebbrix_search", "query", "results", 10),
+                            ("hebbrix_ask", "question", "citations", None),
                         ):
                             error, data = await call(
                                 tool,
                                 **{
                                     parameter: question,
                                     "collection_id": tenant["collection_id"],
+                                    **({"limit": limit} if limit else {}),
                                 },
                             )
                             rows = data.get(rows_key) or []
                             matching = [x for x in rows if x.get("id") == identity]
                             serialized = json.dumps(data)
                             check(
-                                f"{phase}_{tool}_{index}",
+                                f"{phase}_{tool}_{index}_{limit or 'answer'}",
                                 not error
                                 and bool(matching)
                                 and value in serialized
+                                and opposite_ids.get(identity, "no-distractor")
+                                not in {x.get("id") for x in rows}
                                 and "eu-west-3" not in serialized,
                                 evidence_count=len(rows),
                                 synthesis_status=data.get("synthesis_status"),
+                                failure_category=data.get("failure_category"),
+                                diagnostics=data.get("diagnostics"),
                                 grounding_status=(data.get("grounding") or {}).get(
                                     "status"
                                 ),
                             )
+                            await asyncio.sleep(args.pace_seconds)
                     if phase == "settled":
                         for index, question in enumerate(
                             [
                                 "What is Lena Frost's private signing key?",
-                                "What is the production deployment region for Project Unknown?",
                                 "What is Northstar Workshop's staging deployment region?",
+                                "What deployment region is recorded for MCP audit 9d95fa9ad5?",
+                                "What is Oriole Studio's annual revenue?",
+                                "How old is Nora Slate?",
+                                "What is Copper Finch's backup retention period?",
+                                "Which region hosts Silver Quill's development environment?",
+                                "Does Mira Kestrel report to Vale Rios?",
                             ]
                         ):
                             error, data = await call(
@@ -292,7 +418,8 @@ async def main(args):
                             )
                             check(
                                 "graph_edges_extracted",
-                                not error and "cedar labs" in json.dumps(graph).casefold(),
+                                not error
+                                and "cedar labs" in json.dumps(graph).casefold(),
                             )
             async with connect(args, tenants[1]) as (_, call):
                 error, _ = await call("hebbrix_get", memory_id=identities[0])
@@ -335,8 +462,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--mcp", help="Optional hosted MCP URL; defaults to local stdio"
     )
-    parser.add_argument("--version", default="0.5.10")
+    parser.add_argument("--version", default="0.5.11")
     parser.add_argument("--settle-seconds", type=float, default=30)
+    parser.add_argument("--pace-seconds", type=float, default=1)
     parser.add_argument("--require-graph", action="store_true")
     parser.add_argument("--allow-remote", action="store_true")
     args = parser.parse_args()

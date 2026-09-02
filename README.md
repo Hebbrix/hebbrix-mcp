@@ -30,13 +30,31 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
-| 0.5.10 | Hebbrix API 1.1.3 / search-safety-v1 | 33 | Authoritative write receipts, honest graph counts, uniform MCP errors |
+| 0.5.11 | Hebbrix API 1.1.3 / search-safety-v1 / claim-grounding-v28 | 33 | Consistent evidence verification, failure categories, request diagnostics |
 | 0.5.8 | Hebbrix API 1.0.0 / search-safety-v1 | 32 | Adds procedure lifecycle tools |
 
 Version 0.5.10 preserves upstream indexing receipts across writes, updates, and
 polling. Graph status distinguishes related memories from entity relationships.
-The companion API's claim-grounding-v26 contract corrects conversational recall;
+The companion API's claim-grounding-v28 contract verifies named-subject evidence
+consistently across cold and cached retrieval and preserves purpose and direction;
 the adapter never bypasses upstream grounding to manufacture an answer.
+
+Version 0.5.11 adds response-local `diagnostics` (request ID, build, grounding and
+safety versions, and search cache path). An ask fallback includes separate
+`reasoning` and `retrieval` diagnostics. No credentials or memory content are
+included in diagnostics. `synthesis_status` distinguishes `synthesized`,
+`retrieval_only`, and `abstained`. `failure_category` distinguishes unknown facts,
+unverified candidates, unavailable verification, service failures, quota
+exhaustion, and malformed evidence receipts. Legitimate abstention is not a
+transport error. These labels do not weaken the evidence gate.
+
+Reproduce the full customer set and additional distractor checks with
+`python scripts/verify_recall.py --require-graph` against a local API first;
+use `--mcp http://localhost:8099/mcp` for HTTP. Remote fixture writes require
+`--allow-remote`. The verifier creates isolated guests, tests both result limits
+before and after asynchronous processing, then deletes its collections.
+This targeted regression suite is not a representative accuracy benchmark;
+conservative abstentions and probabilistic synthesis remain possible.
 
 Version 0.5.9 makes structured failures real MCP errors over both stdio and
 hosted HTTP, preserves authoritative recall when GraphRAG abstains by returning

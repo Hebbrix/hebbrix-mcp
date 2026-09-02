@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.5.11 — 2026-09-02
+
+- Expose bounded, response-local request/build/grounding diagnostics for search
+  and both legs of ask fallback, without credentials or memory payloads.
+- Distinguish unknown facts, synthesis abstention, unverified candidates,
+  unavailable verification, service failures, quota, and malformed receipts.
+- Preserve explicitly labelled authoritative retrieval-only evidence when
+  synthesis abstains; retain fail-closed receipts and existing readiness rules.
+- Expand the disposable end-to-end verifier to the ten reported questions,
+  six unknown controls, additional paraphrases/distractors, both search limits,
+  fresh/settled requests, corrections, direction and tenant isolation.
+- Companion API claim-grounding-v28 removes the calibrated-score verification
+  shortcut, preserves hosting/purpose qualifiers and reporting direction, and
+  distinguishes missing verification from genuine negative evidence.
+
 ## 0.5.10 — 2026-09-02
 
 - Derive write readiness from the upstream acknowledgement, never from the
