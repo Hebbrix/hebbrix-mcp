@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hebbrix-mcp"
-version = "0.5.10"
+version = "0.5.11"
 description = "Hebbrix MCP server — persistent memory, knowledge graph, and outcome learning for any MCP-compatible agent"
 readme = "README.md"
 license = { text = "MIT" }
