@@ -30,8 +30,13 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
-| 0.5.9 | Hebbrix API 1.0.0 / search-safety-v1 | 33 | Uniform MCP errors, safe recall fallback, graph readiness |
+| 0.5.10 | Hebbrix API 1.1.3 / search-safety-v1 | 33 | Authoritative write receipts, honest graph counts, uniform MCP errors |
 | 0.5.8 | Hebbrix API 1.0.0 / search-safety-v1 | 32 | Adds procedure lifecycle tools |
+
+Version 0.5.10 preserves upstream indexing receipts across writes, updates, and
+polling. Graph status distinguishes related memories from entity relationships.
+The companion API's claim-grounding-v26 contract corrects conversational recall;
+the adapter never bypasses upstream grounding to manufacture an answer.
 
 Version 0.5.9 makes structured failures real MCP errors over both stdio and
 hosted HTTP, preserves authoritative recall when GraphRAG abstains by returning
@@ -180,7 +185,7 @@ A server-level instruction block teaches the model when to reach for each tool, 
     - `tags` (list, optional), `collection_id` (string, optional)
     - `extract` (bool, default false): false stores the text exactly (one memory); true starts a tracked fact-extraction job and may create several atomic memories
     - `wait_for_extraction` (bool, default true): for smart ingestion, poll for up to 20 seconds and return normalized atomic memories. Set false for immediate acknowledgement, then call `hebbrix_extraction_status` with the returned job id.
-    - `wait_for_index` (bool, default true): guarantees **memory-search** availability — `hebbrix_search` returns the fact the moment the call returns. It does **not** cover knowledge-graph enrichment (entities/timelines/graph), which lands asynchronously (~30s); the response's `graph_enrichment: "processing"` flags this.
+    - `wait_for_index` (bool, default true): requests a bounded wait for **memory-search** availability. Check the returned `searchable` acknowledgement: if false, the write is durable but indexing is not confirmed; poll `hebbrix_get(id)` and do not repeat the write. It does **not** cover asynchronous knowledge-graph enrichment; use `hebbrix_graph_status` for durable completion. Its `related_memory_count` counts neighboring memories, not entity relationships; zero neighbors does not mean zero extracted edges.
 - `hebbrix_extraction_status` - Poll a smart-ingestion job until its created/updated memories or terminal error are available.
 - `hebbrix_remember_many` - Store **many** facts in one call (one round-trip, one rate-limit hit). Pass `facts` (list of strings). Falls back to sequential writes on free/agent tiers.
 - `hebbrix_search` - Semantic search (hybrid vector + BM25 + graph retrieval).
@@ -333,7 +338,7 @@ Common issues:
 - **`HTTP 401` on every call** — the key is wrong or revoked. Unset `HEBBRIX_API_KEY`, delete `~/.hebbrix/config.json`, and restart to re-provision, or paste a fresh key from the dashboard.
 - **Agent mode won't start (`auto-signup unavailable`)** — signup may be at daily capacity or your network blocks the API. Set `HEBBRIX_API_KEY` instead.
 - **`claim` says `EMAIL_IN_USE`** — claiming needs an email with no existing Hebbrix account. Use a fresh address (a `you+agent@gmail.com` alias works).
-- **A memory isn't searchable immediately** — pass `wait_for_index=true` (the default) for read-after-write on `hebbrix_search`. Otherwise indexing is asynchronous; typical convergence is under 30 seconds.
+- **A memory isn't searchable immediately** — `wait_for_index=true` requests a bounded wait, not an unconditional guarantee. Check `searchable`; if false, poll `hebbrix_get(id)` and preserve the receipt. Do not repeat an accepted write.
 - **A just-written fact's entities aren't in the graph yet** — knowledge-graph enrichment (entities, timelines, graph queries) runs *asynchronously after* the write and is not covered by `wait_for_index`. It typically lands within ~30s; the write response's `graph_enrichment: "processing"` signals it's still in flight.
 
 ## Development
@@ -348,6 +353,17 @@ hebbrix-mcp                 # starts in agent mode on stdio
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) and [CHANGELOG.md](CHANGELOG.md).
+
+An opt-in integration check reproduces conversational recall, corrections,
+fresh-process retrieval, abstention, isolation, and disposable collection cleanup:
+
+```bash
+uv run --frozen python scripts/verify_recall.py --api http://localhost:8000
+```
+
+It creates synthetic data in two new guest collections and deletes them in a
+cleanup block. Remote targets require `--allow-remote`; `--mcp URL` selects the
+hosted transport and `--require-graph` checks asynchronous graph enrichment too.
 
 ## License
 

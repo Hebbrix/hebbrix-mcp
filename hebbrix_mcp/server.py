@@ -858,7 +858,9 @@ def _shape_extraction_result(
         "updated": result.get("updated_count", result.get("memories_updated")),
         "memories": memories[:10],
         "status": status,
-        "searchable": status == "completed",
+        "searchable": (
+            result.get("searchable", payload.get("searchable", status == "completed")) is True
+        ),
         "graph_enrichment": graph_enrichment,
     }
     if job_id or payload.get("job_id"):
@@ -920,6 +922,21 @@ def _mem_row(m: dict) -> dict[str, Any]:
         "importance": m.get("importance"),
         "created_at": m.get("created_at"),
     }
+
+
+def _index_receipt(data: dict[str, Any]) -> dict[str, Any]:
+    """One readiness projection for raw writes, corrections, and polling."""
+    out = {key: data[key] for key in (
+        "processing_status", "outbox_event_id", "status_url",
+        "index_wait_outcome", "retry_after_seconds",
+    ) if key in data}
+    out["searchable"] = data.get("searchable") is True
+    if not out["searchable"]:
+        out["next_action"] = (
+            "The write is stored but search readiness is not confirmed. "
+            "Poll hebbrix_get with this id; do not repeat the write."
+        )
+    return out
 
 
 def _node_name(v: Any) -> Optional[str]:
@@ -1089,9 +1106,10 @@ async def hebbrix_remember(
       the result includes job_id and an explicit next action.
     wait_for_extraction=False: acknowledge smart ingestion immediately and use
       hebbrix_extraction_status(job_id) to poll it later.
-    wait_for_index=True (default): guarantees MEMORY SEARCH availability — the
-      memory is returned by hebbrix_search the moment this call returns
-      (read-after-write). Set False for fire-and-forget bulk writes.
+    wait_for_index=True (default): asks the API to wait for MEMORY SEARCH
+      availability within its bounded deadline. Inspect searchable: a durable
+      write can return searchable=false if indexing is still pending. Poll
+      hebbrix_get(id) rather than repeating the write. Set False for bulk writes.
 
     Note on the knowledge graph: entities/relationships (hebbrix_search_entities,
     hebbrix_entity_timeline, hebbrix_graph_query) are enriched ASYNCHRONOUSLY and
@@ -1143,7 +1161,8 @@ async def hebbrix_remember(
         for item in out.get("memories") or []:
             _cache_put(item.get("id"), item.get("content"), cid)
         return _u(out)
-    # Default: exact/raw storage. wait_for_index makes it searchable on return.
+    # A wait request is not an acknowledgement. Preserve the durable receipt,
+    # including timeout/poll metadata, rather than inventing index readiness.
     body = {"content": content, "collection_id": cid, "wait_for_index": wait_for_index}
     if tags:
         body["tags"] = tags
@@ -1151,12 +1170,10 @@ async def hebbrix_remember(
     if "error" in data:
         return _u(data)
     _cache_put(data.get("id"), content, cid)
-    return _u({"id": data.get("id"), "status": data.get("processing_status", "pending"),
-               "importance": data.get("importance"), "searchable": wait_for_index,
-               # Memory search is ready (per searchable); entity/graph enrichment
-               # runs asynchronously (typically ready within ~30s), separate from
-               # wait_for_index.
-               "graph_enrichment": "processing"})
+    out = {"id": data.get("id"), "status": data.get("processing_status", "pending"),
+           "importance": data.get("importance"), **_index_receipt(data),
+           "graph_enrichment": "processing"}
+    return _u(out)
 
 
 @mcp.tool(annotations=_READ_TOOL)
@@ -1219,18 +1236,20 @@ async def hebbrix_remember_many(
     if isinstance(data, dict) and "error" in data:
         status = data.get("status")
         if status in (403, 404, 405):
-            ids, failed = [], 0
+            ids, receipts, failed = [], [], 0
             for f in facts:
                 r = await _post("/memories/raw",
                                 {"content": f, "collection_id": cid,
                                  "wait_for_index": wait_for_index})
                 if isinstance(r, dict) and "error" not in r and r.get("id"):
                     ids.append(r.get("id"))
+                    receipts.append({"id": r["id"], **_index_receipt(r)})
                     _cache_put(r.get("id"), f, cid)
                 else:
                     failed += 1
             return _u({"created": len(ids), "failed": failed, "memory_ids": ids,
-                       "fallback": "sequential"})
+                       "fallback": "sequential", "results": receipts,
+                       "searchable": failed == 0 and bool(receipts) and all(r["searchable"] for r in receipts)})
         return _u(data)
     mem_ids = data.get("memory_ids") or [
         r.get("id") or r.get("memory_id") for r in (data.get("results") or [])]
@@ -1653,7 +1672,8 @@ async def hebbrix_get(memory_id: str) -> dict[str, Any]:
             return _u(_fence_results({"id": w["id"], "content": w["content"],
                        "pending_index": True, "metadata": None}, "content"))
         return _u(data)
-    return _u(_fence_results(_mem_row(data) | {"metadata": data.get("metadata")}, "content"))
+    out = _mem_row(data) | {"metadata": data.get("metadata")} | _index_receipt(data)
+    return _u(_fence_results(out, "content"))
 
 
 @mcp.tool(annotations=_OVERWRITE_TOOL)
@@ -1666,8 +1686,8 @@ async def hebbrix_update(
     """Update a memory in place (keeps version history). Use this to CORRECT a
     stored fact instead of remembering a contradicting copy. Pass the new content.
 
-    wait_for_index=True (default): the correction is reflected in search/get/list
-    the moment this returns (read-after-write). Set False for fire-and-forget.
+    wait_for_index=True (default) requests a bounded indexing wait. Check
+    searchable; if false, poll hebbrix_get(id) instead of repeating the update.
     """
     if content is None and importance is None:
         return _fail("pass content and/or importance to update")
@@ -1682,7 +1702,7 @@ async def hebbrix_update(
     # by id, so this REPLACES any earlier cached content for the same memory.
     if content is not None:
         _cache_put(memory_id, content, data.get("collection_id"))
-    return _u(_mem_row(data) | {"updated": True})
+    return _u(_mem_row(data) | {"updated": True} | _index_receipt(data))
 
 
 @mcp.tool(annotations=_DELETE_TOOL)
@@ -1882,10 +1902,9 @@ async def _graph_enrichment_status(
     if not enrichment_ready:
         return out
 
-    # A completed delivery receipt proves the graph projection ran. Only now is
-    # an empty relationship result meaningful. This second read distinguishes a
-    # valid memory with no related graph facts from a temporarily unavailable
-    # graph, but it never decides whether enrichment itself completed.
+    # This endpoint returns RELATED MEMORIES via shared entities, not extracted
+    # entity-to-entity edges. Zero neighbors says nothing about edge extraction.
+    # Keep delivery readiness separate from graph read availability and counts.
     relationships = await _get(
         f"/knowledge-graph/relationships/{_path_segment(memory_id)}"
     )
@@ -1928,22 +1947,20 @@ async def _graph_enrichment_status(
     )
     raw_count = relationships.get("count")
     try:
-        relationship_count = int(
+        related_memory_count = int(
             raw_count if raw_count is not None else len(rows)
         )
     except (TypeError, ValueError):
-        return _fail("invalid graph relationship count response")
+        return _fail("invalid related-memory count response")
     out.update(
         {
-            "status": (
-                "ready"
-                if relationship_count > 0
-                else "complete_no_related_graph_facts"
-            ),
+            "status": "ready",
             "ready": True,
             "graph_check": {
                 "available": True,
-                "relationship_count": relationship_count,
+                "related_memory_count": related_memory_count,
+                "entity_relationship_count": None,
+                "note": "Related-memory neighbors are counted; entity relationships are not counted by this endpoint.",
             },
             "next_action": None,
         }
@@ -1959,9 +1976,10 @@ async def hebbrix_graph_status(
     """Check whether one memory's asynchronous graph enrichment is ready.
 
     ``wait_seconds`` optionally performs bounded polling (maximum 30 seconds).
-    A completed memory can validly have no relationships; that is reported as
-    ``complete_no_related_graph_facts`` rather than being confused with a stuck
-    pipeline. This tool never fabricates edges from spelling conventions.
+    ``ready`` means durable enrichment completed and the graph read succeeded.
+    graph_check.related_memory_count counts neighboring memories, NOT extracted
+    entity relationships. A zero count does not mean no edges were extracted.
+    This tool never fabricates edges from spelling conventions.
     """
 
     return _u(await _graph_enrichment_status(memory_id, wait_seconds))
