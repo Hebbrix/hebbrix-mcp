@@ -292,7 +292,7 @@ async def main(args):
                             )
                             check(
                                 "graph_edges_extracted",
-                                not error and "Cedar Labs" in json.dumps(graph),
+                                not error and "cedar labs" in json.dumps(graph).casefold(),
                             )
             async with connect(args, tenants[1]) as (_, call):
                 error, _ = await call("hebbrix_get", memory_id=identities[0])
