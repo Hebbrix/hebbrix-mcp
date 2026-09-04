@@ -30,7 +30,7 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
-| 0.5.11 | Hebbrix API 1.1.3 / search-safety-v1 / claim-grounding-v28 | 33 | Consistent evidence verification, failure categories, request diagnostics |
+| 0.5.12 | Hebbrix API 1.1.3 / search-safety-v1 / claim-grounding-v29 | 33 | Canonical extraction polling, safe transport errors, consistent evidence diagnostics |
 | 0.5.8 | Hebbrix API 1.0.0 / search-safety-v1 | 32 | Adds procedure lifecycle tools |
 
 Version 0.5.10 preserves upstream indexing receipts across writes, updates, and

@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.12 — 2026-09-04
+
+- Extraction status now polls the canonical `/v1/memory-jobs/{id}` endpoint,
+  including when resuming receipts containing the deprecated URL.
+- Poll URLs are bound to the configured API origin and requested job. The
+  adapter never forwards caller credentials to redirect destinations.
+- Unexpected redirects and malformed/empty JSON responses produce structured
+  MCP errors consistently across HTTP helpers instead of parser exceptions or
+  false success.
+- Adds real-transport regression cases for delayed extraction, legacy receipts,
+  foreign poll URLs, empty redirects and non-JSON gateway responses.
+
 ## 0.5.11 — 2026-09-02
 
 - Expose bounded, response-local request/build/grounding diagnostics for search

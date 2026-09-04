@@ -584,7 +584,7 @@ wheels = [
 
 [[package]]
 name = "hebbrix-mcp"
-version = "0.5.11"
+version = "0.5.12"
 source = { editable = "." }
 dependencies = [
     { name = "cryptography" },

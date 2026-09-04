@@ -771,13 +771,29 @@ def _u(out: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _json_response(r: httpx.Response) -> Any:
+    """Do not interpret redirects/HTML/empty bodies as successful tool results.
+
+    Never automatically forward caller credentials to a redirect destination.
+    Fail with a structured, payload-free error at the transport boundary.
+    """
+    if r.status_code >= 400:
+        return _err(r)
+    if 300 <= r.status_code < 400:
+        return _fail("Upstream returned an unexpected redirect.", r.status_code, ok=False)
+    try:
+        return r.json()
+    except ValueError:
+        return _fail("Upstream returned an invalid JSON response.", r.status_code, ok=False)
+
+
 async def _get(path: str, params: Optional[dict] = None) -> Any:
     r = await _client().get(
         f"{BASE}{path}",
         params={k: v for k, v in (params or {}).items() if v is not None},
         headers=_auth_headers())
     _capture_usage(r)
-    return _err(r) if r.status_code >= 400 else r.json()
+    return _json_response(r)
 
 
 async def _post(path: str, body: dict) -> Any:
@@ -786,7 +802,7 @@ async def _post(path: str, body: dict) -> Any:
         json={k: v for k, v in body.items() if v is not None},
         headers=_auth_headers())
     _capture_usage(r)
-    data = _err(r) if r.status_code >= 400 else r.json()
+    data = _json_response(r)
     if path in {"/search", "/search/reason"} and isinstance(data, dict):
         # Response-local diagnostics, never mutable global state: concurrent
         # hosted tenants must not inherit another request's identifiers.
@@ -806,31 +822,41 @@ async def _patch(path: str, body: dict) -> Any:
         json={k: v for k, v in body.items() if v is not None},
         headers=_auth_headers())
     _capture_usage(r)
-    return _err(r) if r.status_code >= 400 else r.json()
+    return _json_response(r)
 
 
 async def _delete(path: str) -> dict[str, Any]:
     r = await _client().delete(f"{BASE}{path}", headers=_auth_headers())
     _capture_usage(r)
-    if r.status_code >= 400:
-        return _err(r)
+    if r.status_code >= 300:
+        return _json_response(r)
     return {"status": r.status_code, "ok": True}
 
 
 def _relative_api_path(poll_url: str, job_id: str) -> str:
     """Convert an absolute or `/v1/...` poll URL to the path `_get` expects."""
 
+    canonical = f"/memory-jobs/{_path_segment(job_id)}"
     raw = str(poll_url or "").strip()
     if not raw:
-        return f"/memories/jobs/{quote(str(job_id), safe='')}"
+        return canonical
     parsed = urlparse(raw)
+    base = urlparse(BASE)
+    if (parsed.scheme or parsed.netloc) and (
+        parsed.scheme != base.scheme or parsed.netloc != base.netloc
+    ):
+        raise ValueError("Extraction poll URL must use the configured API origin.")
     path = parsed.path if parsed.scheme or parsed.netloc else raw.split("?", 1)[0]
     base_path = urlparse(BASE).path.rstrip("/")
     if base_path and path.startswith(base_path + "/"):
         path = path[len(base_path):]
     if not path.startswith("/"):
         path = "/" + path
-    return path
+    # Old ingestion receipts used the now-redirected alias. Poll directly at
+    # the canonical endpoint while accepting receipts issued before upgrade.
+    if path not in {canonical, f"/memories/jobs/{_path_segment(job_id)}"}:
+        raise ValueError("Extraction poll URL does not match the requested job.")
+    return canonical
 
 
 def _shape_extraction_result(
@@ -885,7 +911,10 @@ def _shape_extraction_result(
 
 
 async def _memory_job_status(job_id: str, poll_url: Optional[str] = None) -> dict[str, Any]:
-    path = _relative_api_path(poll_url or "", job_id)
+    try:
+        path = _relative_api_path(poll_url or "", job_id)
+    except ValueError:
+        return _fail("Invalid extraction poll URL.", ok=False)
     data = await _get(path)
     if not isinstance(data, dict):
         return {"error": "invalid extraction job response", "status": "failed"}

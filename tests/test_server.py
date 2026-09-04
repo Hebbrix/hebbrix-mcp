@@ -1342,7 +1342,7 @@ def test_remember_extract_polls_job_to_actionable_memories(monkeypatch):
     assert out["status"] == "completed"
     assert out["extracted"] == 2
     assert [m["id"] for m in out["memories"]] == ["m1", "m2"]
-    assert client.calls[-1][1].endswith("/v1/memories/jobs/job-1")
+    assert client.calls[-1][1].endswith("/v1/memory-jobs/job-1")
 
 
 def test_remember_extract_can_return_immediately_with_poll_instruction(monkeypatch):
@@ -1369,7 +1369,7 @@ def test_extraction_status_normalizes_completed_job(monkeypatch):
     out = asyncio.run(S.hebbrix_extraction_status("job-3", collection_id="c1"))
     assert out["status"] == "completed"
     assert out["memories"] == [{"id": "m3", "content": "A fact.", "event": "ADD"}]
-    assert client.calls[-1][1].endswith("/v1/memories/jobs/job-3")
+    assert client.calls[-1][1].endswith("/v1/memory-jobs/job-3")
 
 
 def test_extraction_status_preserves_terminal_failure(monkeypatch):
