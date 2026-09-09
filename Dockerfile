@@ -10,7 +10,7 @@
 #   docker run -p 8080:8080 hebbrix-mcp        # serves http://0.0.0.0:8080/mcp
 #   curl localhost:8080/healthz                # -> {"status":"ok",...} (no auth)
 #
-FROM ghcr.io/astral-sh/uv:0.8.4@sha256:40775a79214294fb51d097c9117592f193bcfdfc634f4daa0e169ee965b10ef0 AS uv
+FROM ghcr.io/astral-sh/uv:0.12.12@sha256:73d2665b478d8fa2de1cf105c6841f8e9cb6b09e568fc7700440c09f8fcd7ac4 AS uv
 FROM python:3.12-slim@sha256:e5c9fa26ffb76e11e0f054f30dc2523a2f9693f0c36c0cf1e39b27e152d899fc AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
