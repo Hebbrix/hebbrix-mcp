@@ -237,11 +237,24 @@ A server-level instruction block teaches the model when to reach for each tool, 
 **Reasoning & account**
 
 - `hebbrix_ask` - **One-call GraphRAG.** Ask a natural-language question; it searches memory, synthesizes an answer with an LLM, and cites the memory ids it used. If synthesis abstains while authoritative search has grounded evidence, it returns that evidence as `synthesis_status: "retrieval_only"` instead of silently losing recall or pretending synthesis succeeded.
-- `hebbrix_confidence` - How confident should the agent be before acting? Grounded in memory + past outcomes.
+- `hebbrix_confidence` - Read separate memory support and action-confidence signals,
+  with ASK/REVIEW/ACT advice. Pass policy/action/context for exact configured
+  evidence. Memory similarity alone never earns ACT. Advice is not permission.
 - `hebbrix_log_decision` - Record a decision and its outcome; feeds future confidence. Right after a `hebbrix_confidence` check you can log just the `outcome` — the description auto-fills from what you asked.
-- `hebbrix_choose_action` - Safely choose among repeatable strategies and create
-  a causal decision receipt before acting. Supports per-user/context policies and
-  explicitly bounded exploration.
+- `hebbrix_choose_action` - Choose among repeatable strategies and create a
+  decision receipt before acting. Supports per-user/context policies and bounded
+  exploration; neither a receipt nor caller-supplied outcomes establish causality
+  or execution authority. `adaptive_exploration=true` requires an explicitly
+  configured posterior-sampling policy and low-risk exploration opt-ins.
+- `hebbrix_context_schema` - Enroll the immutable declared context before the
+  first decision. Fields use `{name: {values: [...], required: true}}`. Optional
+  backoff never drops required fields. Only change contracts on owner instruction.
+- `hebbrix_configure_policy` - Revision-checked configuration of strategy, bounded
+  priors, decay, window and action risk. Requires explicit owner instruction;
+  never silently lower risk or replace the action target to obtain ACT advice.
+- `hebbrix_policy_advice` - Read a scoped evidence card with ranked actions,
+  uncertainty, reported failure attempts, descriptive change alerts and an
+  exploration candidate. Not a chosen-action receipt or permission to execute.
 - `hebbrix_report_outcome` - Close that decision loop later with `success`, a
   bounded reward, or configured business metrics. Corrections replace prior
   evidence instead of double-counting it.

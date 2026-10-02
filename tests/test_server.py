@@ -121,6 +121,10 @@ class FakeClient:
         self.calls.append(("PATCH", url, kw))
         return self._response
 
+    async def put(self, url, **kw):
+        self.calls.append(("PUT", url, kw))
+        return self._response
+
     async def delete(self, url, **kw):
         self.calls.append(("DELETE", url, kw))
         return self._response
@@ -180,9 +184,10 @@ def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 33
+        assert len(tools) == 36
         names = {t.name for t in tools}
         assert "hebbrix_extraction_status" in names
+        assert {"hebbrix_configure_policy", "hebbrix_context_schema", "hebbrix_policy_advice"} <= names
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
                          "hebbrix_update", "hebbrix_forget", "hebbrix_list",
                          "hebbrix_history", "hebbrix_search_entities",
