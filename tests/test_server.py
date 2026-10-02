@@ -184,7 +184,7 @@ def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 36
+        assert len(tools) == 38
         names = {t.name for t in tools}
         assert "hebbrix_extraction_status" in names
         assert {"hebbrix_configure_policy", "hebbrix_context_schema", "hebbrix_policy_advice"} <= names
@@ -305,7 +305,7 @@ def test_outcome_memory_choice_report_and_insights(monkeypatch):
     assert choice["decision_id"] == "d1"
     assert choice["chosen_action_key"] == "concise"
     sent = client.calls[-1][2]["json"]
-    assert sent["mode"] == "recommend"
+    assert sent["mode"] == "auto"  # Old/unconfigured policies remain conservative.
     assert sent["baseline_action_key"] == "concise"
     assert sent["candidates"] == [
         {"action_key": "concise"}, {"action_key": "detailed"}

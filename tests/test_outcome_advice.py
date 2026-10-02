@@ -50,3 +50,20 @@ def test_search_keeps_final_api_outcome_order_at_saturated_scores(monkeypatch):
     result = asyncio.run(S.hebbrix_search("Fix slow requests", collection_id="c", min_score=0))
     assert [r["id"] for r in result["results"]] == ["b", "a"]
     assert result["results"][1]["outcome_evidence"]["failures"] == 6
+
+
+def test_new_setup_report_and_auto_prior_wire(monkeypatch):
+    write=AsyncMock(return_value={"decision_id":"d", "revision":1})
+    read=AsyncMock(return_value={"authorization_granted":False})
+    monkeypatch.setattr(S,"_post",write)
+    monkeypatch.setattr(S,"_get",read)
+    asyncio.run(S.hebbrix_setup_policy("p",{"version":"v1","fields":{}},{"a":{"risk_tier":"low"}},"u","c"))
+    assert write.call_args.args[0]=="/learning/policies/p/setup"
+    asyncio.run(S.hebbrix_learning_report("p",7,"u","c"))
+    assert read.call_args.args==( "/learning/policies/p/report",dict(days=7,collection_id="c",user_id="u"))
+    asyncio.run(S.hebbrix_choose_action("p",["a","b"],prior_action="b",prior_strength=4))
+    assert write.call_args.args[1]["mode"]=="auto"
+    assert write.call_args.args[1]["prior_action"]=="b"
+    before=write.call_count
+    assert "error" in asyncio.run(S.hebbrix_choose_action("p",["a","b"],prior_action="x",prior_strength=4))
+    assert write.call_count==before
