@@ -121,6 +121,10 @@ class FakeClient:
         self.calls.append(("PATCH", url, kw))
         return self._response
 
+    async def put(self, url, **kw):
+        self.calls.append(("PUT", url, kw))
+        return self._response
+
     async def delete(self, url, **kw):
         self.calls.append(("DELETE", url, kw))
         return self._response
@@ -180,9 +184,10 @@ def test_shared_client_uses_http2_and_burst_sized_keepalive_pool(monkeypatch):
 def test_all_tools_resources_prompts_registered():
     async def check():
         tools = await S.mcp.list_tools()
-        assert len(tools) == 33
+        assert len(tools) == 38
         names = {t.name for t in tools}
         assert "hebbrix_extraction_status" in names
+        assert {"hebbrix_configure_policy", "hebbrix_context_schema", "hebbrix_policy_advice"} <= names
         for expected in ("hebbrix_remember", "hebbrix_search", "hebbrix_get",
                          "hebbrix_update", "hebbrix_forget", "hebbrix_list",
                          "hebbrix_history", "hebbrix_search_entities",
@@ -300,7 +305,7 @@ def test_outcome_memory_choice_report_and_insights(monkeypatch):
     assert choice["decision_id"] == "d1"
     assert choice["chosen_action_key"] == "concise"
     sent = client.calls[-1][2]["json"]
-    assert sent["mode"] == "recommend"
+    assert sent["mode"] == "auto"  # Old/unconfigured policies remain conservative.
     assert sent["baseline_action_key"] == "concise"
     assert sent["candidates"] == [
         {"action_key": "concise"}, {"action_key": "detailed"}
@@ -1342,7 +1347,7 @@ def test_remember_extract_polls_job_to_actionable_memories(monkeypatch):
     assert out["status"] == "completed"
     assert out["extracted"] == 2
     assert [m["id"] for m in out["memories"]] == ["m1", "m2"]
-    assert client.calls[-1][1].endswith("/v1/memories/jobs/job-1")
+    assert client.calls[-1][1].endswith("/v1/memory-jobs/job-1")
 
 
 def test_remember_extract_can_return_immediately_with_poll_instruction(monkeypatch):
@@ -1369,7 +1374,7 @@ def test_extraction_status_normalizes_completed_job(monkeypatch):
     out = asyncio.run(S.hebbrix_extraction_status("job-3", collection_id="c1"))
     assert out["status"] == "completed"
     assert out["memories"] == [{"id": "m3", "content": "A fact.", "event": "ADD"}]
-    assert client.calls[-1][1].endswith("/v1/memories/jobs/job-3")
+    assert client.calls[-1][1].endswith("/v1/memory-jobs/job-3")
 
 
 def test_extraction_status_preserves_terminal_failure(monkeypatch):

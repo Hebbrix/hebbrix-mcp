@@ -8,7 +8,7 @@ on:
       tag:
         description: Git tag to publish
         required: true
-        default: v0.5.11
+        default: v0.5.12
         type: string
 
 permissions:
