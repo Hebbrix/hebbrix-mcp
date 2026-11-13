@@ -411,6 +411,17 @@ def test_ask_degraded_reasoning_is_error(backend, mcp_server):
     assert payload["answer"] is None
 
 
+def test_search_unavailable_status_is_an_error_to_retry(backend, mcp_server):
+    # API 1.4.30: a service the evidence depends on failed and nothing
+    # answers. It is never reported as an unknown fact.
+    backend.reset({SEARCH: (200, search_envelope(**NO_MATCH | dict(answer_status="unavailable")))})
+    is_error, payload = mcp_server.call("hebbrix_search", query="Which database does Atlas use?")
+    assert is_error is True
+    assert payload["failure_category"] == "service_failure"
+    assert payload["answer_status"] == "unavailable"
+    _no_evidence(payload)
+
+
 # ----------------------------------------------------------------------------
 # Defect 10: citations carry the supporting passage, never a silent cut.
 # ----------------------------------------------------------------------------

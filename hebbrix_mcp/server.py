@@ -1877,6 +1877,10 @@ def _envelope_verdict(
         if flags
         else f"answer_status_{answer_status}" if not_answerable else "no_answer"
     )
+    if answer_status == "unavailable":
+        # A service the evidence depends on failed: operational, not an
+        # answer about memory (isError, retry).
+        return "service_failure", reason
     if answer_status == "indexing" or "index_pending" in (
         data.get("confidence_reason"),
         data.get("abstain_reason"),
@@ -1904,6 +1908,9 @@ ANSWER_STATUSES = (
     "unverified",
     "indexing",
     "no_relevant_memory",
+    # API 1.4.30: a service the evidence depends on failed and nothing
+    # answers. Retry; never report the fact as absent.
+    "unavailable",
 )
 _ANSWER_ACTIONS = {
     "answerable": "answer",
@@ -1912,6 +1919,7 @@ _ANSWER_ACTIONS = {
     "unverified": "abstain",
     "indexing": "retry",
     "no_relevant_memory": "say_unknown",
+    "unavailable": "retry",
 }
 _INDEXING_FIELDS = (
     "status",
@@ -2044,6 +2052,10 @@ def _readiness_fields(
             reason=reason,
         ),
     }
+    if upstream.get("answer_finality") in ("final", "provisional", "none"):
+        # API 1.4.30: final = answerable over a fully indexed scope;
+        # provisional = answerable from what is indexed so far.
+        fields["answer_finality"] = upstream["answer_finality"]
     if isinstance(upstream.get("confidence_reason"), str):
         fields["confidence_reason"] = upstream["confidence_reason"]
     if isinstance(upstream.get("degraded_sources"), list):
