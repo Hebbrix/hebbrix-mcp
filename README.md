@@ -30,8 +30,25 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
+| 0.5.15 | Hebbrix API 1.4 / search-safety-v1 | 38 | End-user scope, readiness answer gate, supporting-passage citations, one `isError` rule, fail-closed envelope validation, working extraction defaults |
 | 0.5.12 | Hebbrix API 1.1.3 / search-safety-v1 / claim-grounding-v29 | 33 | Canonical extraction polling, safe transport errors, consistent evidence diagnostics |
 | 0.5.8 | Hebbrix API 1.0.0 / search-safety-v1 | 32 | Adds procedure lifecycle tools |
+
+Version 0.5.15 adds explicit `user_id` / `agent_id` / `run_id` scope to every
+memory, retrieval and graph tool the API can scope (see
+[End users, scope and authorization](#end-users-scope-and-authorization)),
+exposes the API's readiness fields and an SDK-equivalent `answer_gate` on search
+and ask (see [Answer readiness](#answer-readiness-and-strict-gating)), returns
+the API's supporting passage (or the whole memory) as each ask citation, and
+validates every search and ask envelope with one fail-closed check (see
+[Errors and fail-closed evidence](#errors-and-fail-closed-evidence)).
+`hebbrix_remember(extract=True)` works with its defaults again. Behaviour changes
+to note when upgrading: quota exhaustion, degraded evidence and malformed
+evidence receipts are now MCP errors (`isError: true`) on every tool; `degraded`
+now means the evidence pipeline itself degraded, while a scope that is still
+indexing is reported through `indexing` and `answer_gate.ready` and keeps the
+evidence the API keeps; citations gain `passage`, `truncated` and
+`content_length` fields.
 
 Version 0.5.10 preserves upstream indexing receipts across writes, updates, and
 polling. Graph status distinguishes related memories from entity relationships.
@@ -189,6 +206,8 @@ All optional. With nothing set, the server starts in agent mode.
 | `HEBBRIX_MCP_PORT` | `8080` | Bind port (HTTP transports) |
 | `HEBBRIX_MCP_MULTI_TENANT` | off | Hosted mode: per-request `Authorization` header auth |
 | `HEBBRIX_MCP_ACCOUNTLESS` | off | Hosted mode: mint a bounded guest identity on unauthenticated `initialize` |
+| `HEBBRIX_USER_ID` / `HEBBRIX_AGENT_ID` / `HEBBRIX_RUN_ID` | *(none)* | Pin the end-user / agent / run scope of a local server; tool arguments cannot change it |
+| `HEBBRIX_EXTRACTION_POLL_SECONDS` | `20` (max 25) | How long `hebbrix_remember(extract=True)` waits for its extraction job and search readiness |
 | `HEBBRIX_MCP_SESSION_SECRET` | *(required for accountless)* | HMAC secret for stateless Secure guest cookies |
 | `HEBBRIX_MCP_INTERNAL_SECRET` | *(required for accountless)* | HMAC trust bridge for original-client signup throttling |
 
@@ -201,19 +220,27 @@ A server-level instruction block teaches the model when to reach for each tool, 
 - `hebbrix_remember` - Store a fact, decision, or preference.
     - `content` (string, required): the memory text
     - `tags` (list, optional), `collection_id` (string, optional)
+    - `user_id`, `agent_id`, `run_id` (string, optional): store the memory for one end user / agent / run
     - `extract` (bool, default false): false stores the text exactly (one memory); true starts a tracked fact-extraction job and may create several atomic memories
     - `wait_for_extraction` (bool, default true): for smart ingestion, poll for up to 20 seconds and return normalized atomic memories. Set false for immediate acknowledgement, then call `hebbrix_extraction_status` with the returned job id.
-    - `wait_for_index` (bool, default true): requests a bounded wait for **memory-search** availability. Check the returned `searchable` acknowledgement: if false, the write is durable but indexing is not confirmed; poll `hebbrix_get(id)` and do not repeat the write. It does **not** cover asynchronous knowledge-graph enrichment; use `hebbrix_graph_status` for durable completion. Its `related_memory_count` counts neighboring memories, not entity relationships; zero neighbors does not mean zero extracted edges.
-- `hebbrix_extraction_status` - Poll a smart-ingestion job until its created/updated memories or terminal error are available.
+    - `wait_for_index` (bool, default true): waits, within a bounded deadline, for **memory-search** availability. For a raw write the API performs the wait; for `extract=true` the adapter polls the job and its readiness receipt (`/v1/memories/batches/{outbox_event_id}`), because the API rejects `wait_for_index` together with background extraction. Check the returned `searchable` acknowledgement: if false, the write is durable but indexing is not confirmed; poll `hebbrix_get(id)` and do not repeat the write. It does **not** cover asynchronous knowledge-graph enrichment; use `hebbrix_graph_status` for durable completion. Its `related_memory_count` counts neighboring memories, not entity relationships; zero neighbors does not mean zero extracted edges.
+- `hebbrix_extraction_status` - Poll a smart-ingestion job until its created/updated memories or terminal error are available; a completed job's `searchable` comes from its readiness receipt.
 - `hebbrix_remember_many` - Store **many** facts in one call (one round-trip, one rate-limit hit). Pass `facts` (list of strings). Falls back to sequential writes on free/agent tiers.
 - `hebbrix_search` - Semantic search (hybrid vector + BM25 + graph retrieval).
     - `query` (string, required), `limit` (int, optional), `collection_id` (string, optional)
+    - `user_id`, `agent_id`, `run_id` (string, optional): search one end user / agent / run (required for a collection holding end-user data)
     - `min_score` (float, default 0.0): drop weak matches — zero-relevance padding is always dropped; raise this to filter noise so you don't pay tokens for it.
-- `hebbrix_get` - Fetch one memory by id, with metadata.
+    - Results carry the readiness fields and `answer_gate` described in [Answer readiness](#answer-readiness-and-strict-gating).
+- `hebbrix_get` - Fetch one memory by id, with metadata. `user_id` / `agent_id` / `run_id` / `collection_id` require the memory to belong to that exact scope.
 - `hebbrix_update` - Correct a memory **in place** (old versions are kept).
 - `hebbrix_forget` - Delete a memory by id.
-- `hebbrix_list` - List recent memories.
+- `hebbrix_list` - List recent memories (content previews; a cut preview has `truncated: true`).
 - `hebbrix_history` - See how a memory changed over time.
+
+All memory tools above, `hebbrix_export`, `hebbrix_import` and `hebbrix_graph_status`
+accept `user_id`, `agent_id` and `run_id`; the graph read tools and
+`hebbrix_confidence` accept `user_id` (graph data is attributed to end users, not
+agents or runs).
 - `hebbrix_mark_used` - Reinforce a memory you actually used (`helpful=True` strengthens it, `False` weakens it) so recall improves over time.
 - `hebbrix_export` - Export a whole collection (memories + graph entities + profile) as JSON or Markdown, in one call.
 - `hebbrix_import` - The inverse of export: import a list of facts, an export JSON, or notes/markdown into a collection (restore a backup, migrate, or seed from `CLAUDE.md`).
@@ -242,7 +269,8 @@ or automatic execution is established. These tools never grant permission.
 
 **Reasoning & account**
 
-- `hebbrix_ask` - **One-call GraphRAG.** Ask a natural-language question; it searches memory, synthesizes an answer with an LLM, and cites the memory ids it used. If synthesis abstains while authoritative search has grounded evidence, it returns that evidence as `synthesis_status: "retrieval_only"` instead of silently losing recall or pretending synthesis succeeded.
+- `hebbrix_ask` - **One-call GraphRAG.** Ask a natural-language question; it searches memory, synthesizes an answer with an LLM, and cites the memory ids it used. If synthesis abstains while authoritative search has grounded evidence, it returns that evidence as `synthesis_status: "retrieval_only"` instead of silently losing recall or pretending synthesis succeeded. Accepts `user_id` / `agent_id` / `run_id`.
+    - Each citation is `{id, content, score, passage, truncated, content_length}`. `content` is the API's verbatim supporting passage for that memory (`passage: "supporting_span"`) when the API reports one, otherwise the whole memory (`"full_content"`), cut only beyond 4,000 characters (`"leading_characters"`). Whenever `content` is not the whole memory, `truncated` is `true` and `fetch_full_content` names the `hebbrix_get` call (with the same scope) that returns all of it.
 - `hebbrix_confidence` - Read separate memory support and action-confidence signals,
   with ASK/REVIEW/ACT advice. Pass policy/action/context for exact configured
   evidence. Memory similarity alone never earns ACT. Advice is not permission.
@@ -290,6 +318,111 @@ MCP hosts still control their own tool-call history, so configure the host to
 redact secret inputs if it persists conversation or tracing data.
 
 The server also exposes a `hebbrix://profile` resource and a `context` prompt that inject the user's compiled profile.
+
+## End users, scope and authorization
+
+- **The account API key is the principal.** Every tool call authenticates as the
+  account that owns the key, and that account can read and write every memory in
+  its collections.
+- **`user_id`, `agent_id` and `run_id` are caller-asserted scope.** The API
+  applies them exactly: writes are stored under them; search, ask, list and export
+  return only that scope; ID-addressed tools (`hebbrix_get`, `hebbrix_update`,
+  `hebbrix_forget`, `hebbrix_history`, `hebbrix_graph_status`) return not found
+  unless the memory belongs to it. A collection that holds end-user data refuses
+  an unscoped read (`HTTP 400 end_user_scope_required`, surfaced as an MCP error):
+  a collection alone is not a user boundary. A collection with the API's
+  `require_user_id` setting also refuses unscoped ID reads.
+- **Your application must bind `user_id` to its own authenticated user.** The
+  adapter does not authenticate end users. Never take `user_id` from end-user
+  input or let a model choose it. When a model drives the tool calls, pin the
+  scope for the whole session: `HEBBRIX_USER_ID` / `HEBBRIX_AGENT_ID` /
+  `HEBBRIX_RUN_ID` for a local server, or the `X-Hebbrix-User-Id` /
+  `X-Hebbrix-Agent-Id` / `X-Hebbrix-Run-Id` request headers for a hosted one. A
+  tool argument that differs from a pinned value is refused (`error_code:
+  scope_pinned`), and a tool that cannot be narrowed to a pinned field refuses
+  rather than read wider (`unsupported_scope`; Outcome Memory tools apply only
+  `user_id`, which is their only scope dimension).
+- **Memory IDs are not secrets.** Any holder of the account key can fetch any of
+  the account's memories by ID; pass the scope to `hebbrix_get` to require that
+  the memory belongs to it, and never treat an ID as a capability.
+- **Enforcement.** API keys carry operation permissions (for example
+  `memories:read`) and an admin capability for cross-user reads, but the API has
+  no end-user-bound keys today. The end-user boundary is therefore asserted by the
+  application that holds the key, not enforced by the credential: keep the
+  account key out of end-user-controlled code and pin the scope where your
+  application, not the end user or the model, sets it.
+
+## Answer readiness and strict gating
+
+`hebbrix_search` and `hebbrix_ask` return the API's readiness and abstention
+fields in a stable shape. `answer_status`, `indexing`, `no_match`,
+`abstain_recommended`, `evidence_withheld`, `failure_category` and `answer_gate`
+are always present (`answer_status` and `indexing` are `null` when the API did
+not send them); the verbatim API fields below appear when the API sends them, and
+`safety_reason` whenever evidence is withheld:
+
+| Field | Meaning |
+|---|---|
+| `answer_status` | The API's `answer_status`: `answerable`, `conflicting`, `superseded`, `unverified`, `indexing`, `no_relevant_memory` |
+| `indexing` | The API's scope readiness: `status` (`ready`/`incomplete`/`failed`/`unknown`), `pending_memories`, `keyword_only_memories`, `failed_memories`, `capped`, `answer_risk` (`none`/`may_change`/`incomplete_set`) |
+| `no_match`, `abstain_recommended` | Abstention flags (true whenever evidence is withheld) |
+| `confidence_reason`, `degraded_sources` | Search only, verbatim from the API |
+| `decision_abstained`, `abstain_reason`, `reasoning_status` | Ask only, verbatim from the reasoning API |
+| `evidence_withheld`, `failure_category`, `safety_reason` | Whether and why this adapter withheld evidence |
+| `answer_gate` | The answer decision below |
+
+`answer_gate` is `{ready, safe_to_answer, reason, action, require_ready:
+{safe_to_answer, reason, action}}`. It is derived only from those REST fields,
+exactly as the Python SDK derives it: `safe_to_answer` equals
+`should_answer(response)` and `require_ready.safe_to_answer` equals
+`should_answer(response, require_ready=True)` on the same REST response
+(history mode off). `ready` is the SDK's readiness test (`indexing.status` is
+`ready` and `answer_risk` is `none`). Both decisions are additionally `false`
+whenever this adapter withheld the evidence. `action` is one of `answer`,
+`ask_user`, `say_no_longer_current`, `abstain`, `retry`, `say_unknown`,
+`verify_authorization` or `use_as_context`.
+
+For high-stakes flows (money, health, actions), answer only when
+`answer_gate.require_ready.safe_to_answer` is true and otherwise follow
+`answer_gate.require_ready.action` (`retry` while the scope is indexing). No
+separate MCP helper tool is planned: the gate is part of every search and ask
+result. An answer read from a scope that is still indexing (`answer_risk:
+may_change`) is returned with `ready: false`, as the API returns it; a count,
+total or list over an incompletely indexed scope is withheld by the API itself.
+
+## Errors and fail-closed evidence
+
+One rule decides `isError` for every tool, at the protocol boundary, over stdio
+and hosted HTTP alike: a result is an MCP error exactly when it carries a
+top-level `error`, reports `degraded: true` (the evidence pipeline itself
+degraded), or has an operational `failure_category` (`service_failure`,
+`verification_unavailable`, `quota_exhausted`, `malformed_evidence_receipt`).
+The error content is the same JSON payload with `ok: false`. An ordinary
+abstention is a successful result with no evidence: `unknown_fact`,
+`synthesis_abstention`, `unverified_candidates` or `index_pending`. An ask that
+recovers through its retrieval-only fallback succeeds and reports the failed leg
+in `reasoning_failure_category`.
+
+Every search and ask envelope (including the ask fallback's search) passes one
+fail-closed check before any evidence or answer is returned. Evidence and answers
+are withheld, with `evidence_withheld: true` and the reason in `safety_reason`,
+whenever:
+
+- any abstention or no-match signal is set (`no_match`, `abstain_recommended`,
+  `decision_abstained`, or an `answer_status` other than `answerable`);
+- the grounding receipt is missing, empty, lacks a status, has an unknown status,
+  or is ungrounded (`no_grounded_match`, `verification_unavailable`,
+  `grounded: false`) while evidence is present;
+- `safety_contract_version` is missing, null or unsupported (supported:
+  `search-safety-v1`);
+- the envelope contradicts itself: evidence beside `no_match`, an answer beside
+  `decision_abstained`, `answerable` beside an abstention flag, evidence IDs that
+  are not exactly the returned rows, duplicate or empty IDs, or a non-abstaining
+  response without rows;
+- the API reports its evidence pipeline degraded or verification unavailable.
+
+Contradictions and contract violations are `malformed_evidence_receipt` (an MCP
+error); abstentions are not errors.
 
 ## Make Hebbrix the agent's memory
 
@@ -385,6 +518,7 @@ Common issues:
 - **`HTTP 401` on every call** — the key is wrong or revoked. Unset `HEBBRIX_API_KEY`, delete `~/.hebbrix/config.json`, and restart to re-provision, or paste a fresh key from the dashboard.
 - **Agent mode won't start (`auto-signup unavailable`)** — signup may be at daily capacity or your network blocks the API. Set `HEBBRIX_API_KEY` instead.
 - **`claim` says `EMAIL_IN_USE`** — claiming needs an email with no existing Hebbrix account. Use a fresh address (a `you+agent@gmail.com` alias works).
+- **`HTTP 400 ... Provide user_id to read a collection containing end-user data`** — the collection stores memories for end users; pass the end user's `user_id` (or pin it) on search, ask, list and export.
 - **A memory isn't searchable immediately** — `wait_for_index=true` requests a bounded wait, not an unconditional guarantee. Check `searchable`; if false, poll `hebbrix_get(id)` and preserve the receipt. Do not repeat an accepted write.
 - **A just-written fact's entities aren't in the graph yet** — knowledge-graph enrichment (entities, timelines, graph queries) runs *asynchronously after* the write and is not covered by `wait_for_index`. It typically lands within ~30s; the write response's `graph_enrichment: "processing"` signals it's still in flight.
 
@@ -411,6 +545,21 @@ uv run --frozen python scripts/verify_recall.py --api http://localhost:8000
 It creates synthetic data in two new guest collections and deletes them in a
 cleanup block. Remote targets require `--allow-remote`; `--mcp URL` selects the
 hosted transport and `--require-graph` checks asynchronous graph enrichment too.
+
+The offline suite includes protocol tests that drive the real server over stdio
+against a loopback mock of the REST API. An opt-in live compatibility test runs
+the same stdio protocol against a real API (remember plain and with extraction,
+search, ask, get, and end-user scope), in disposable collections it deletes
+afterwards:
+
+```bash
+HEBBRIX_LIVE_API_URL=http://localhost:8000 \
+HEBBRIX_LIVE_API_KEY_FILE=/path/to/key.json \
+uv run --frozen pytest tests/test_live_api.py -q -W error
+```
+
+The key is read from `HEBBRIX_LIVE_API_KEY` or the `api_key` field of the JSON
+file and is never printed. Non-local APIs require `HEBBRIX_LIVE_ALLOW_REMOTE=1`.
 
 ## License
 

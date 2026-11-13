@@ -1,5 +1,55 @@
 # Changelog
 
+## 0.5.15 — 2026-11-13
+
+- **End-user scope.** `hebbrix_search`, `hebbrix_ask`, `hebbrix_remember`,
+  `hebbrix_remember_many`, `hebbrix_import`, `hebbrix_get`, `hebbrix_update`,
+  `hebbrix_forget`, `hebbrix_list`, `hebbrix_history`, `hebbrix_export`,
+  `hebbrix_extraction_status` and `hebbrix_graph_status` accept validated
+  `user_id`, `agent_id` and `run_id`; the graph read tools and
+  `hebbrix_confidence` accept `user_id`. Values are forwarded exactly as the REST
+  API expects (request body for writes and search/reason, query constraints for
+  ID-addressed reads and mutations). A collection holding end-user data no longer
+  fails without a way to scope it, and the API's guidance is surfaced verbatim.
+  An application can pin the scope for a session (`HEBBRIX_USER_ID` /
+  `HEBBRIX_AGENT_ID` / `HEBBRIX_RUN_ID`, or `X-Hebbrix-User-Id` / `-Agent-Id` /
+  `-Run-Id` headers on a hosted server); tool arguments cannot change a pinned
+  value, and a tool that cannot apply a pinned field refuses instead of reading
+  wider. The local read-after-write cache serves a write only to its own scope.
+  The README documents the authorization model.
+- **Extraction defaults work.** `hebbrix_remember(extract=True)` no longer sends
+  `wait_for_index` together with `async_dispatch=true`, which the API rejects
+  with HTTP 422. It polls the extraction job and then the job's readiness
+  receipt for search availability. A completed job's `searchable` now comes from
+  that receipt instead of being reported false.
+- **Readiness for strict gating.** Search and ask results expose the API's
+  `answer_status`, `indexing` (`status`, `pending_memories`, `answer_risk`, ...),
+  `confidence_reason`, `decision_abstained`, `abstain_reason` and
+  `reasoning_status`, plus `answer_gate`, which is the Python SDK's
+  `should_answer` decision on the same REST response with and without
+  `require_ready`.
+- **Citations.** Ask citations carry the API's verbatim supporting passage for
+  each memory when it reports one, otherwise the whole memory; any citation that
+  is not the whole memory is marked `truncated: true` with the `hebbrix_get` call
+  that returns the rest. The previous silent 240-character cut is gone.
+- **One `isError` rule.** Every tool's result is an MCP error exactly when it has
+  an `error`, degraded evidence, or an operational `failure_category`
+  (`service_failure`, `verification_unavailable`, `quota_exhausted`,
+  `malformed_evidence_receipt`). Degraded search responses and exhausted
+  reasoning quota are now MCP errors; abstentions remain successful results.
+- **One fail-closed envelope check** for search, ask and ask's fallback.
+  Evidence and answers are withheld whenever any abstention or no-match signal
+  is set, the grounding receipt is missing, empty or ungrounded, the safety
+  contract version is missing, null or unsupported, or the envelope contradicts
+  itself (for example `decision_abstained` beside an answer).
+- A scope that is still indexing (the API's coverage-only degradation) keeps the
+  evidence the API returns and reports `answer_gate.ready: false`; `degraded`
+  now means the evidence pipeline itself degraded.
+- Protocol-level regression tests drive the real server over stdio against a
+  loopback mock of the REST API. An opt-in live compatibility test
+  (`HEBBRIX_LIVE_API_URL`) exercises remember, extraction, search, ask, get and
+  end-user scope against a real API.
+
 ## 0.5.12 — 2026-09-04
 
 - Extraction status now polls the canonical `/v1/memory-jobs/{id}` endpoint,
