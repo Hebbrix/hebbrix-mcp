@@ -57,9 +57,12 @@ def test_ask_distinguishes_unknown_from_operational_failure(
     assert result["answer"] is None
     assert result["citations"] == []
     assert result["abstain_recommended"] is True
-    assert bool(result.get("error")) == (
-        expected
-        in {"service_failure", "verification_unavailable", "malformed_evidence_receipt"}
+    # One rule for every tool: an operational failure (including an exhausted
+    # reasoning budget, which cannot recover on retry) is an error; an unknown
+    # fact is an ordinary abstention.
+    assert bool(result.get("error")) == (expected in S.OPERATIONAL_FAILURES)
+    assert (S._operational_failure(result) is not None) == (
+        expected in S.OPERATIONAL_FAILURES
     )
 
 

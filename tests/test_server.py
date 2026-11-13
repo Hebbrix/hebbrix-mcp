@@ -234,17 +234,22 @@ def test_remember_returns_id_and_status(monkeypatch):
     assert out["id"] == "m1" and out["status"] == "pending"
 
 
-def test_smart_remember_always_selects_tracked_async_contract(monkeypatch):
+@pytest.mark.parametrize("wait_for_index", [True, False])
+def test_smart_remember_always_selects_tracked_async_contract(monkeypatch, wait_for_index):
+    """The API rejects wait_for_index with async_dispatch=true (HTTP 422), so the
+    tracked job never forwards it; readiness comes from the job instead."""
     client = _fake(monkeypatch, FakeResponse(200, {"results": [
         {"id": "m1", "memory": "User likes tea", "event": "ADD"}
     ]}))
     out = asyncio.run(S.hebbrix_remember(
-        "I like tea", collection_id="c1", extract=True, wait_for_index=True
+        "I like tea", collection_id="c1", extract=True, wait_for_index=wait_for_index
     ))
     sent = client.calls[-1][2]["json"]
     assert sent["async_dispatch"] is True
-    assert sent["wait_for_index"] is True
-    assert out["id"] == "m1" and out["searchable"] is True
+    assert "wait_for_index" not in sent
+    # An inline result without an explicit acknowledgement is not proof of
+    # search readiness.
+    assert out["id"] == "m1" and out["searchable"] is False
 
 
 def test_smart_remember_async_response_is_truthful(monkeypatch):
@@ -783,7 +788,10 @@ def test_ask_uses_reason_and_cites(monkeypatch):
     monkeypatch.setattr(S, "_client", lambda: client)
     out = asyncio.run(S.hebbrix_ask("who works on Atlas?", collection_id="c1"))
     assert out["answer"] == "Sarah does."
-    assert out["citations"] == [{"id": "m1", "content": "Sarah works on Atlas", "score": 0.9}]
+    assert out["citations"] == [{
+        "id": "m1", "content": "Sarah works on Atlas", "score": 0.9,
+        "passage": "full_content", "truncated": False, "content_length": 20,
+    }]
 
 
 def test_ask_does_not_use_unreceipted_graph_facts_to_bypass_abstention(monkeypatch):
@@ -897,6 +905,9 @@ def test_ask_uses_authoritative_retrieval_when_reason_unavailable(monkeypatch):
         "id": "m9",
         "content": "The production deployment region is eu-west-1.",
         "score": 0.7,
+        "passage": "full_content",
+        "truncated": False,
+        "content_length": 46,
     }]
     assert out["abstain_recommended"] is False
     assert out["evidence_ids"] == ["m9"]
