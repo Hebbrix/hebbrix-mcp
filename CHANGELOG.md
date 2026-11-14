@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- **Documentation: binding the end user's scope.** The README opens with the
+  authorization model for applications with several end users (the account key
+  is the principal, `user_id` is not proof of identity, the application pins the
+  scope before an agent sees a tool, reads by ID need its boundary too) and gives
+  complete examples: a server-side gateway pinning `X-Hebbrix-User-Id` per
+  session on the hosted server, one local process per user with
+  `HEBBRIX_USER_ID`, and removing and rejecting model-supplied scope arguments.
+
 ## 0.5.15 — 2026-11-13
 
 - **End-user scope.** `hebbrix_search`, `hebbrix_ask`, `hebbrix_remember`,

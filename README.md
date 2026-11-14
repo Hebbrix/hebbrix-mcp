@@ -26,6 +26,16 @@ Your agent forgets everything when the session ends. This fixes that, and goes f
 
 Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other MCP client.
 
+> [!IMPORTANT]
+> **Serving more than one end user? Bind each session's user in your application.**
+> The account API key is the principal: whoever holds it, a model included, can
+> reach every memory of the account. A `user_id` is a filter, not proof of who is
+> asking. Authenticate the end user in your application, pin their `user_id` for
+> the MCP session before the agent sees any tool (`X-Hebbrix-User-Id` on a hosted
+> server, `HEBBRIX_USER_ID` on a local one), and never let the model choose it.
+> Complete hosted and local examples:
+> [End users, scope and authorization](#end-users-scope-and-authorization).
+
 ### Release compatibility
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
@@ -321,6 +331,24 @@ The server also exposes a `hebbrix://profile` resource and a `context` prompt th
 
 ## End users, scope and authorization
 
+Read this before giving an agent memory tools in an application with several
+end users. Hebbrix cannot tell which of your users is talking to the agent; only
+your application can. The rules:
+
+1. **The account API key is the principal.** Keep it on your server.
+2. **A `user_id` is not proof of identity.** It is a filter the API applies
+   exactly, whoever sends it.
+3. **Bind the authenticated user's scope before the agent sees a tool.** Pin
+   `user_id` (and `agent_id` / `run_id` if you use them) for the MCP session from
+   your own authentication, and do not let the model or the end user supply it.
+4. **Reads by ID need your authorization boundary too.** A memory ID is not a
+   secret or a capability: `hebbrix_get` (and `GET /v1/memories/{id}`) return any
+   memory of the account unless the scope is passed, so pin the scope (the
+   adapter then applies it to every ID-addressed tool) or check the memory's
+   owner in your application before showing it.
+
+In detail:
+
 - **The account API key is the principal.** Every tool call authenticates as the
   account that owns the key, and that account can read and write every memory in
   its collections.
@@ -351,6 +379,146 @@ The server also exposes a `hebbrix://profile` resource and a `context` prompt th
   application that holds the key, not enforced by the credential: keep the
   account key out of end-user-controlled code and pin the scope where your
   application, not the end user or the model, sets it.
+
+### Secure multi-user setup: hosted server
+
+Your application's server is the gateway: it authenticates the end user, then
+opens that user's MCP session to `https://mcp.hebbrix.com/mcp` with the account
+key and `X-Hebbrix-User-Id` set to the authenticated user. The hosted server is
+stateless and reads the pin from every request, so set the header on every
+request of the session; a client created with fixed headers, as below, does.
+
+```python
+# Runs on your server, never in the browser. pip install mcp
+import os
+from contextlib import asynccontextmanager
+
+from mcp import ClientSession
+from mcp.client.streamable_http import streamablehttp_client
+
+HEBBRIX_MCP_URL = "https://mcp.hebbrix.com/mcp"
+HEBBRIX_API_KEY = os.environ["HEBBRIX_API_KEY"]  # the account key: server-side only
+
+# Scope belongs to the application. The model never sees or sets these.
+SCOPE_ARGUMENTS = {"user_id", "agent_id", "run_id", "collection_id"}
+
+
+@asynccontextmanager
+async def memory_session(authenticated_user_id: str):
+    """One MCP session per authenticated end-user session.
+
+    authenticated_user_id comes from your own sign-in (session cookie, OAuth
+    token, ...), never from the request body, a tool argument or the model.
+    """
+    headers = {
+        "Authorization": f"Bearer {HEBBRIX_API_KEY}",
+        "X-Hebbrix-User-Id": authenticated_user_id,  # pinned for every request
+    }
+    async with streamablehttp_client(HEBBRIX_MCP_URL, headers=headers) as (read, write, _):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            yield session
+
+
+def tools_for_model(tools):
+    """The tool list the model sees: scope arguments removed from every schema."""
+    exposed = []
+    for tool in tools:
+        schema = dict(tool.inputSchema or {})
+        schema["properties"] = {
+            name: spec
+            for name, spec in (schema.get("properties") or {}).items()
+            if name not in SCOPE_ARGUMENTS
+        }
+        schema["required"] = [
+            name for name in schema.get("required", []) if name not in SCOPE_ARGUMENTS
+        ]
+        exposed.append({"name": tool.name, "description": tool.description,
+                        "input_schema": schema})
+    return exposed
+
+
+async def call_tool_for_model(session: ClientSession, name: str, arguments: dict):
+    """Forward a model's tool call; reject any attempt to choose the scope."""
+    overrides = SCOPE_ARGUMENTS & set(arguments)
+    if overrides:
+        return {"isError": True,
+                "error": f"scope is set by the application: {sorted(overrides)}"}
+    return await session.call_tool(name, arguments)
+
+
+# In a request handler, after your own authentication:
+#   async with memory_session(current_user.id) as session:
+#       tools = tools_for_model((await session.list_tools()).tools)
+#       ... run the model with `tools`; route each tool call through
+#       call_tool_for_model(session, call.name, call.arguments)
+```
+
+Two layers hold the scope. Your application drops and rejects scope arguments
+from the model, and the pinned header makes the server refuse any tool argument
+that differs from it (`error_code: "scope_pinned"`, `isError: true`) and apply the
+pinned user to every tool, including the ID-addressed ones: `hebbrix_get` with
+another user's memory ID returns not found. A tool that cannot be narrowed to a
+pinned field refuses (`unsupported_scope`) rather than read wider.
+
+If instead you put a reverse proxy between an MCP client you do not control and
+the hosted server, the proxy must do the same on every request: authenticate
+the end user, remove any `Authorization`, `Cookie` and `X-Hebbrix-*` headers the
+client sent, then add the account key and `X-Hebbrix-User-Id` for the
+authenticated user. A request that reaches the server without the header is not
+pinned. A self-hosted multi-tenant server (`HEBBRIX_MCP_MULTI_TENANT=1`) reads
+the same headers.
+
+### Secure multi-user setup: local server
+
+A local (stdio) server reads its pin from the environment when it starts, so run
+one process per end-user session and set `HEBBRIX_USER_ID` from your
+authentication:
+
+```python
+import os
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+
+
+def hebbrix_server_for(authenticated_user_id: str) -> StdioServerParameters:
+    return StdioServerParameters(
+        command="uvx",
+        args=["hebbrix-mcp"],
+        env={
+            "PATH": os.environ["PATH"],
+            "HEBBRIX_API_KEY": os.environ["HEBBRIX_API_KEY"],
+            "HEBBRIX_USER_ID": authenticated_user_id,  # fixed for this process
+        },
+    )
+
+
+# async with stdio_client(hebbrix_server_for(current_user.id)) as (read, write):
+#     async with ClientSession(read, write) as session:
+#         await session.initialize()
+#         ... expose tools_for_model(...) and call_tool_for_model(...) as above
+```
+
+For one person on their own machine the same pin is a client config entry:
+
+```json
+{
+  "mcpServers": {
+    "hebbrix": {
+      "command": "uvx",
+      "args": ["hebbrix-mcp"],
+      "env": { "HEBBRIX_API_KEY": "mem_sk_...", "HEBBRIX_USER_ID": "user-123" }
+    }
+  }
+}
+```
+
+Never share one local process between end users: its pin is the user it was
+started for. A self-hosted single-tenant HTTP server (`--transport
+streamable-http` without `HEBBRIX_MCP_MULTI_TENANT`) also takes its pin from the
+environment, for every request it serves; run one per end user, or run the
+multi-tenant mode and pin with headers.
 
 ## Answer readiness and strict gating
 
