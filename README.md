@@ -40,6 +40,7 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
+| 0.5.16 | Hebbrix API 1.4 / search-safety-v1 | 38 | Documentation only: binding each end user's scope, with hosted and local examples |
 | 0.5.15 | Hebbrix API 1.4 / search-safety-v1 | 38 | End-user scope, readiness answer gate, supporting-passage citations, one `isError` rule, fail-closed envelope validation, working extraction defaults |
 | 0.5.12 | Hebbrix API 1.1.3 / search-safety-v1 / claim-grounding-v29 | 33 | Canonical extraction polling, safe transport errors, consistent evidence diagnostics |
 | 0.5.8 | Hebbrix API 1.0.0 / search-safety-v1 | 32 | Adds procedure lifecycle tools |

@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## 0.5.16 — 2026-11-14
+
+Documentation only; the server is unchanged from 0.5.15.
+
 
 - **Documentation: binding the end user's scope.** The README opens with the
   authorization model for applications with several end users (the account key
