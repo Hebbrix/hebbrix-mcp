@@ -104,7 +104,8 @@ class StdioMCP:
         self._ready: concurrent.futures.Future = concurrent.futures.Future()
         self._stop: Optional[asyncio.Event] = None
         self._main_future = asyncio.run_coroutine_threadsafe(self._main(env), self._loop)
-        self.session, self.server_version = self._ready.result(timeout=90)
+        self.session, self.initialize_result = self._ready.result(timeout=90)
+        self.server_version = self.initialize_result.serverInfo.version
 
     async def _main(self, env: dict[str, str]) -> None:
         self._stop = asyncio.Event()
@@ -118,12 +119,18 @@ class StdioMCP:
                 async with stdio_client(params, errlog=quiet) as streams:
                     async with ClientSession(*streams) as session:
                         init = await session.initialize()
-                        self._ready.set_result((session, init.serverInfo.version))
+                        self._ready.set_result((session, init))
                         await self._stop.wait()
             except BaseException as exc:
                 if not self._ready.done():
                     self._ready.set_exception(exc)
                 raise
+
+    def list_tools(self) -> list[Any]:
+        """The tool list exactly as a client receives it over the transport."""
+        return asyncio.run_coroutine_threadsafe(
+            self.session.list_tools(), self._loop
+        ).result(timeout=60).tools
 
     def call(self, name: str, **arguments: Any) -> tuple[bool, dict[str, Any]]:
         """Call a tool; return (isError, payload) exactly as a client sees them."""

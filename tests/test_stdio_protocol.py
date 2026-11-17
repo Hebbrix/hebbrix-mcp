@@ -9,6 +9,7 @@ payload) and what the adapter sent upstream.
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
 import pytest
@@ -715,3 +716,35 @@ def test_isolation_rule_applies_to_non_search_tools(backend, mcp_server):
                    ("GET", "/v1/collections"): (200, {"items": []})})
     assert mcp_server.call("hebbrix_get", memory_id="m404")[0] is True
     assert mcp_server.call("hebbrix_list_collections")[0] is False
+
+
+def test_initialize_sends_the_instructions_and_a_compact_tool_list(mcp_server):
+    """What a client receives over the real transport, not the in-process objects."""
+    from hebbrix_mcp.server import INSTRUCTIONS
+
+    assert mcp_server.initialize_result.instructions == INSTRUCTIONS
+    tools = mcp_server.list_tools()
+    assert len(tools) == 38
+    wire = json.dumps([t.model_dump(mode="json", by_alias=True, exclude_none=True) for t in tools])
+    assert '"title"' not in wire and '"anyOf"' not in wire
+    search = next(t for t in tools if t.name == "hebbrix_search")
+    assert search.description.startswith("Search the user's long-term memory. Call this FIRST")
+    assert search.inputSchema["properties"]["user_id"] == {"type": ["string", "null"]}
+
+
+def test_optional_arguments_still_accept_explicit_null(backend, mcp_server):
+    """The compacted schema advertises [X, "null"]; the server must honour null."""
+    # Its own memory id: earlier tests in this module tombstone m1 in the session.
+    row = dict(ROW, id="m-null", memory_id="m-null")
+    backend.reset({SEARCH: (200, search_envelope(
+        results=[row], evidence_ids=["m-null"],
+        evidence_claims=[{"memory_id": "m-null", "status": "supported"}],
+    ))})
+    is_error, payload = mcp_server.call(
+        "hebbrix_search", query="Which database does Atlas use?",
+        collection_id=None, user_id=None, agent_id=None, run_id=None,
+    )
+    assert is_error is False
+    assert [row["id"] for row in payload["results"]] == ["m-null"]
+    sent = backend.sent(*SEARCH)[-1]
+    assert sent["json"]["collection_id"] == "c-protocol"

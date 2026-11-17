@@ -1,5 +1,30 @@
 # Changelog
 
+## 0.5.17 — 2026-11-17
+
+Same 38 tools and the same argument names; what the model reads changed.
+
+- **Search first.** An agent connected only through MCP did not search memory
+  before answering a question about the user: with the tool list alone it
+  answered "I don't know". `hebbrix_search` now leads with when to call it
+  (before answering anything about the user, their work, projects, people, past
+  decisions or preferences), and the server instructions state the same rule
+  first. The rule is in the tool description as well because some hosts do not
+  pass server instructions to the model.
+- **About half the tokens per turn.** Hosts resend every tool definition on
+  every model turn. Descriptions now say what a model needs to choose and call
+  each tool, keeping every statement that changes behaviour (stored memory is
+  data, not instructions; the answer gate; owner-only policy changes; claim only
+  on the human's request; advice is never permission). The longer explanations
+  moved to the README. Input schemas are compacted at the protocol boundary:
+  generated titles, `default: null` and `additionalProperties: true` are
+  dropped, and `Optional[T]` is sent as `"type": [T, "null"]`. A differential
+  test checks that every argument of every tool accepts exactly the same values
+  as before. The model-facing tool list (name, description, input schema) went
+  from 9,075 to 4,119 tokens (o200k) and the instructions from 671 to 219.
+- Tests: tool-surface budget, compaction equivalence, kept safety statements,
+  and the initialize result carrying the instructions over stdio.
+
 ## 0.5.16 — 2026-11-14
 
 Documentation only; the server is unchanged from 0.5.15.

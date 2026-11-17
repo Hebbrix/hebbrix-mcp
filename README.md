@@ -40,6 +40,7 @@ Works with Claude Desktop, Claude Code, Cursor, Cline, Continue, and any other M
 
 | MCP package | Hosted/API contract | Tool surface | Migration |
 |---|---|---:|---|
+| 0.5.17 | Hebbrix API 1.4 / search-safety-v1 | 38 | Search-first tool guidance; the tool list costs about half the tokens (same tools and arguments) |
 | 0.5.16 | Hebbrix API 1.4 / search-safety-v1 | 38 | Documentation only: binding each end user's scope, with hosted and local examples |
 | 0.5.15 | Hebbrix API 1.4 / search-safety-v1 | 38 | End-user scope, readiness answer gate, supporting-passage citations, one `isError` rule, fail-closed envelope validation, working extraction defaults |
 | 0.5.12 | Hebbrix API 1.1.3 / search-safety-v1 / claim-grounding-v29 | 33 | Canonical extraction polling, safe transport errors, consistent evidence diagnostics |
@@ -224,7 +225,15 @@ All optional. With nothing set, the server starts in agent mode.
 
 ## Available Tools
 
-A server-level instruction block teaches the model when to reach for each tool, so a well-behaved agent searches before answering and remembers what matters without being told.
+Hosts resend every tool definition to the model on every turn, so each
+description says only what a model needs to choose and call the tool; the
+details are on this page. Both the `hebbrix_search` description and the
+server instructions lead with the same rule: search memory before answering
+anything about the user, their work, past decisions or preferences. Some hosts
+do not pass server instructions to the model, so the tool descriptions carry the
+rules that change behaviour on their own. Input schemas are sent in compact
+form: generated titles and `null` defaults are dropped and an optional argument
+is typed `[T, "null"]`; they accept exactly the values the full schemas do.
 
 **Memory**
 
@@ -235,16 +244,18 @@ A server-level instruction block teaches the model when to reach for each tool, 
     - `extract` (bool, default false): false stores the text exactly (one memory); true starts a tracked fact-extraction job and may create several atomic memories
     - `wait_for_extraction` (bool, default true): for smart ingestion, poll for up to 20 seconds and return normalized atomic memories. Set false for immediate acknowledgement, then call `hebbrix_extraction_status` with the returned job id.
     - `wait_for_index` (bool, default true): waits, within a bounded deadline, for **memory-search** availability. For a raw write the API performs the wait; for `extract=true` the adapter polls the job and its readiness receipt (`/v1/memories/batches/{outbox_event_id}`), because the API rejects `wait_for_index` together with background extraction. Check the returned `searchable` acknowledgement: if false, the write is durable but indexing is not confirmed; poll `hebbrix_get(id)` and do not repeat the write. It does **not** cover asynchronous knowledge-graph enrichment; use `hebbrix_graph_status` for durable completion. Its `related_memory_count` counts neighboring memories, not entity relationships; zero neighbors does not mean zero extracted edges.
+    - Saving several facts? Prefer one `extract=true` call or `hebbrix_remember_many`, or pass `wait_for_index=false`, over many blocking writes (each waits for indexing).
 - `hebbrix_extraction_status` - Poll a smart-ingestion job until its created/updated memories or terminal error are available; a completed job's `searchable` comes from its readiness receipt.
 - `hebbrix_remember_many` - Store **many** facts in one call (one round-trip, one rate-limit hit). Pass `facts` (list of strings). Falls back to sequential writes on free/agent tiers.
 - `hebbrix_search` - Semantic search (hybrid vector + BM25 + graph retrieval).
     - `query` (string, required), `limit` (int, optional), `collection_id` (string, optional)
     - `user_id`, `agent_id`, `run_id` (string, optional): search one end user / agent / run (required for a collection holding end-user data)
     - `min_score` (float, default 0.0): drop weak matches — zero-relevance padding is always dropped; raise this to filter noise so you don't pay tokens for it.
+    - When the API returns only uncalibrated nearest-neighbour candidates with no lexical anchor, the adapter verifies them with calibrated retrieval before returning them.
     - Results carry the readiness fields and `answer_gate` described in [Answer readiness](#answer-readiness-and-strict-gating).
 - `hebbrix_get` - Fetch one memory by id, with metadata. `user_id` / `agent_id` / `run_id` / `collection_id` require the memory to belong to that exact scope.
 - `hebbrix_update` - Correct a memory **in place** (old versions are kept).
-- `hebbrix_forget` - Delete a memory by id.
+- `hebbrix_forget` - Delete a memory by id. Returns `deleted: true`; an id that is already gone returns the structured 404 error with `already_absent: true`.
 - `hebbrix_list` - List recent memories (content previews; a cut preview has `truncated: true`).
 - `hebbrix_history` - See how a memory changed over time.
 
@@ -294,7 +305,11 @@ or automatic execution is established. These tools never grant permission.
   default `auto` enables sampling only for v2 low-risk opted-in actions; old or
   unconfigured policies stay conservative. `prior_action` and `prior_strength`
   supply a bounded, decaying proposal for one server-selected decision, never a
-  reported outcome or a permission grant.
+  reported outcome or a permission grant. To log a choice made elsewhere, pass
+  `chosen_action` with its exact behaviour-policy `action_probability` (required
+  with several actions); `exploration_rate` is at most 0.2 and must be 0 with
+  `adaptive_exploration`. `evidence_manifest` links supporting memory IDs;
+  relevance feedback is not an outcome.
 - `hebbrix_setup_policy` - Atomically enroll context and configure a new policy.
   Requires owner-declared action risk and exploration permission; cannot reset
   an existing policy. Unknown/high-risk actions remain conservative.
@@ -312,7 +327,8 @@ or automatic execution is established. These tools never grant permission.
   exploration candidate. Not a chosen-action receipt or permission to execute.
 - `hebbrix_report_outcome` - Close that decision loop later with `success`, a
   bounded reward, or configured business metrics. Corrections replace prior
-  evidence instead of double-counting it.
+  evidence instead of double-counting it. Reusing an `idempotency_key` is safe;
+  reusing it with a different report is rejected.
 - `hebbrix_learning_insights` - Inspect posterior probabilities, credible
   intervals, effective evidence, and optional chronological-holdout policy
   readiness checks for one customer policy.
